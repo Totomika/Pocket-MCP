@@ -1,0 +1,19 @@
+# IDE (IntelliJ / Android Studio)
+/.idea/  
+/*.iml
+
+# Build (Gradle & Kotlin)
+/build/
+/.gradle/
+/.kotlin/
+
+# Local (Environment-specific)
+/local.properties
+
+# OS (Operating System artifacts)
+.DS_Store  
+Thumbs.db
+
+# Other
+/.temp/
+/AGENTS.md

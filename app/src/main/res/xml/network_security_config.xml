@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- MCP over Streamable HTTP 是明文 HTTP, AI 客户端连 127.0.0.1:PORT 走 cleartext -->
+    <!-- Android 9+ 默认禁 cleartext, 必须配置允许 localhost -->
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">127.0.0.1</domain>
+        <domain includeSubdomains="true">localhost</domain>
+    </domain-config>
+</network-security-config>

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?><!--
+    简易 MCP 服务通知图标。
+    白色圆形背景 + 深色 "M" 字母, 适合前台服务通知栏小图标。
+    使用 vector drawable 以支持任意密度。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- 圆形背景 -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M12,2C6.48,2 2,6.48 2,12s4.48,10 10,10 10,-4.48 10,-10S17.52,2 12,2z" />
+    <!-- M 字母 -->
+    <path
+        android:fillColor="#1A1A1A"
+        android:pathData="M7,16L7,8L9.5,8L12,12L14.5,8L17,8L17,16L15,16L15,11L13,14.5L11,14.5L9,11L9,16z" />
+</vector>
