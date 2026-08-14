@@ -2,11 +2,13 @@ package io.github.totomika.pocketmcp.mcp
 
 import io.github.totomika.pocketmcp.runtime.RuntimeManager
 import io.github.totomika.pocketmcp.script.RuntimeConfig
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 /**
  * 服务 (MCP Server) 管理器。
@@ -311,8 +313,13 @@ class ServiceManager(
                 instructions = instructions,
             )
         } catch (e: Exception) {
-            for (ns in enabledRefs.map { it.namespace }) {
-                runtimeManager.release(ns)
+            // 释放已 acquire 的 runtime 引用 (对未 acquire 的 ns 是 no-op)。
+            // NonCancellable: 调用方协程被取消时也必须完成释放, 否则引用计数泄漏,
+            // 后续 acquire 会误复用/误销毁 runtime。
+            withContext(NonCancellable) {
+                for (ns in enabledRefs.map { it.namespace }) {
+                    runtimeManager.release(ns)
+                }
             }
             throw e
         }
