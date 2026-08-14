@@ -40,6 +40,7 @@ class RuntimeManager(
                 // 中毒的 runtime (OOM/超时导致引擎损坏): 销毁重建, 不复用。
                 // 保留旧 refCount: 其他服务仍持有引用, 重建后它们的引用转移到新 runtime,
                 // 不能重置为 1, 否则其他服务 release 时会过早销毁新 runtime。
+                // 注意: destroy() 是探测式销毁, 死循环卡死时走孤儿化, 永不阻塞本 mutex。
                 val preservedRef = existing.refCount
                 existing.destroy()
                 runtimes.remove(namespace)
@@ -98,7 +99,10 @@ class RuntimeManager(
 
     /** 销毁所有 runtime。 */
     suspend fun destroyAll() = mutex.withLock {
-        runtimes.values.forEach { it.destroy() }
+        // destroy 是 suspend, 不能放 forEach 内
+        for (entry in runtimes.values) {
+            entry.destroy()
+        }
         runtimes.clear()
     }
 }

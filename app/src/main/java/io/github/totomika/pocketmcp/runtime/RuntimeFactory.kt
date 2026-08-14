@@ -4,8 +4,11 @@ import com.dokar.quickjs.QuickJs
 import io.github.totomika.pocketmcp.data.log.LogManager
 import io.github.totomika.pocketmcp.script.RuntimeConfig
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.newSingleThreadContext
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -29,6 +32,12 @@ class RuntimeFactory(
      *
      * 每个 runtime 拥有独立的单线程 dispatcher, 避免死循环脚本阻塞共享线程池。
      *
+     * 失败清理: 任何一步失败 (evaluate 语法错误 / extractTools 异常等) 都会关闭
+     * quickJs 与 dispatcher 并 rethrow — 否则 JNI global ref 会 pin 住 native runtime
+     * 和一条真实 OS 线程永久泄漏 (QuickJs initGlobals 的 NewGlobalRef 只有 close 才释放)。
+     * 清理全程 NonCancellable: 若调用方协程在 evaluate 期间被取消 (如脚本顶层死循环
+     * 时外部取消), 默认上下文下清理会被 CancellationException 跳过 → 泄漏。
+     *
      * @param runtimeConfig 高级配置 (memoryLimit / maxStackSize), null = 用默认值
      * @throws com.dokar.quickjs.QuickJsException 脚本 evaluate 失败
      */
@@ -38,39 +47,58 @@ class RuntimeFactory(
         runtimeConfig: RuntimeConfig? = null,
     ): RuntimeEntry {
         val dispatcher = newSingleThreadContext("quickjs-$namespace")
-        val quickJs = QuickJs.create(dispatcher)
+        // stage tracking: quickJs / entry 可能在某步失败时尚未创建, 清理时需判空
+        var quickJs: QuickJs? = null
+        var entry: RuntimeEntry? = null
+        try {
+            val qjs = QuickJs.create(dispatcher)
+            quickJs = qjs
+            val e = RuntimeEntry(
+                namespace = namespace,
+                quickJs = qjs,
+                dispatcher = dispatcher,
+            )
+            entry = e
 
-        // 内存 + 栈限制: 优先用 runtimeConfig, null 字段回退到默认值
-        // 注意: QuickJS 的 JS_SetMemoryLimit(ctx, 0) 是"0 字节可用"而非"无限制"!
-        // RuntimeConfig 中 0 = 无限制, 需转为极大值传给 QuickJS
-        quickJs.memoryLimit = runtimeConfig?.memoryLimit?.let { if (it == 0L) UNLIMITED else it } ?: DEFAULT_MEMORY_LIMIT
-        quickJs.maxStackSize = runtimeConfig?.maxStackSize?.let { if (it == 0L) UNLIMITED else it } ?: DEFAULT_MAX_STACK_SIZE
+            // 尽早注册销毁回调 (在 injectAll 之前): host API 注入中途失败时,
+            // catch 走 onDestroy 单一清理路径即可覆盖已注入的资源, 无 double-run
+            e.onDestroy = { hostApiRegistry?.cleanupAll(namespace) }
 
-        val entry = RuntimeEntry(
-            namespace = namespace,
-            quickJs = quickJs,
-            dispatcher = dispatcher,
-        )
+            // 内存 + 栈限制: 优先用 runtimeConfig, null 字段回退到默认值
+            // 注意: QuickJS 的 JS_SetMemoryLimit(ctx, 0) 是"0 字节可用"而非"无限制"!
+            // RuntimeConfig 中 0 = 无限制, 需转为极大值传给 QuickJS
+            qjs.memoryLimit = runtimeConfig?.memoryLimit?.let { if (it == 0L) UNLIMITED else it } ?: DEFAULT_MEMORY_LIMIT
+            qjs.maxStackSize = runtimeConfig?.maxStackSize?.let { if (it == 0L) UNLIMITED else it } ?: DEFAULT_MAX_STACK_SIZE
 
-        // 注入 mcp 对象
-        injectMcpObject(quickJs, namespace)
+            // 注入 mcp 对象
+            injectMcpObject(qjs, namespace)
 
-        // 注入 host.* 第 0 层 API (console, timer, crypto)
-        HostApiInjector.inject(quickJs, entry.scope, dispatcher, namespace, logManager)
+            // 注入 host.* 第 0 层 API (console, timer, crypto)
+            HostApiInjector.inject(qjs, e.scope, dispatcher, namespace, logManager)
 
-        // 注入 host.* 第 1-4 层 API (kv/sql/fs/fetch/system, M3)
-        hostApiRegistry?.injectAll(quickJs, namespace, entry.scope)
+            // 注入 host.* 第 1-4 层 API (kv/sql/fs/fetch/system, M3)
+            hostApiRegistry?.injectAll(qjs, namespace, e.scope)
 
-        // 注册销毁回调: 清理 host API 持有的资源
-        entry.onDestroy = { hostApiRegistry?.cleanupAll(namespace) }
+            // evaluate 脚本 (注册工具) — evaluate 是 suspend, 自动 drain pending jobs
+            qjs.evaluate<Any?>(scriptCode)
 
-        // evaluate 脚本 (注册工具) — evaluate 是 suspend, 自动 drain pending jobs
-        quickJs.evaluate<Any?>(scriptCode)
+            // 提取已注册的工具
+            extractTools(qjs, e.toolRegistry)
 
-        // 提取已注册的工具
-        extractTools(quickJs, entry.toolRegistry)
-
-        return entry
+            return e
+        } catch (ex: Exception) {
+            // P1-1 修复: create 失败必须清理, 否则 native runtime + 专用线程永久泄漏。
+            // NonCancellable: 即使调用方已被取消 (evaluate 卡死时外部取消), 清理也完成。
+            withContext(NonCancellable) {
+                entry?.onDestroy?.invoke() // cleanupAll(namespace), 幂等
+                entry?.scope?.cancel()
+                // safeCloseQuickJs 防 evaluate 半卡死场景: 若脚本顶层死循环导致 evaluate
+                // 被取消, jsMutex 仍被 dispatcher 线程持有, 直接 close() 会自旋卡死
+                safeCloseQuickJs(quickJs, dispatcher)
+                dispatcher.close()
+            }
+            throw ex
+        }
     }
 
     /**
