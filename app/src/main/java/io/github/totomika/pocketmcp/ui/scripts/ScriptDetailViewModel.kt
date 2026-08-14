@@ -1,4 +1,4 @@
-﻿package io.github.totomika.pocketmcp.ui.scripts
+package io.github.totomika.pocketmcp.ui.scripts
 
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
@@ -271,7 +271,10 @@ class ScriptDetailViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun toggleScriptEnabled(serviceId: String, namespace: String, enabled: Boolean) {
         viewModelScope.launch {
-            serviceManager.toggleScriptEnabled(serviceId, namespace, enabled)
+            // 服务运行中 toggle 会 rebuildTools → acquire → evaluate, 不能在 Main 线程跑
+            withContext(Dispatchers.Default) {
+                serviceManager.toggleScriptEnabled(serviceId, namespace, enabled)
+            }
             // 刷新服务列表以反映新的运行状态
             val allServices = serviceManager.getAllServices()
             _services.value = allServices.mapNotNull { service ->

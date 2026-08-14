@@ -1,4 +1,4 @@
-﻿package io.github.totomika.pocketmcp.ui.services
+package io.github.totomika.pocketmcp.ui.services
 
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
@@ -180,9 +180,12 @@ class ServiceDetailViewModel(app: Application) : AndroidViewModel(app) {
     /** 批量添加脚本到服务。 */
     fun addScripts(serviceId: String, namespaces: List<String>) {
         viewModelScope.launch {
-            for (namespace in namespaces) {
-                val code = scriptRepository.readScriptCode(namespace) ?: continue
-                serviceManager.addScriptToService(serviceId, namespace, code, enabled = true)
+            // 服务运行中 addScriptToService 会 rebuildTools → acquire → evaluate, 不能在 Main 线程跑
+            withContext(Dispatchers.Default) {
+                for (namespace in namespaces) {
+                    val code = scriptRepository.readScriptCode(namespace) ?: continue
+                    serviceManager.addScriptToService(serviceId, namespace, code, enabled = true)
+                }
             }
             refreshScriptDetails(serviceId)
         }
@@ -191,7 +194,10 @@ class ServiceDetailViewModel(app: Application) : AndroidViewModel(app) {
     /** 从服务移除脚本。 */
     fun removeScript(serviceId: String, namespace: String) {
         viewModelScope.launch {
-            serviceManager.removeScriptFromService(serviceId, namespace)
+            // 服务运行中 removeScriptFromService 会 rebuildTools → acquire → evaluate, 不能在 Main 线程跑
+            withContext(Dispatchers.Default) {
+                serviceManager.removeScriptFromService(serviceId, namespace)
+            }
             refreshScriptDetails(serviceId)
         }
     }
