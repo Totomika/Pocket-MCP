@@ -381,241 +381,188 @@ private fun ImportMethodCard(
 }
 
 private fun buildAiPrompt(userNeed: String): String {
-    return """你是一位资深 MCP (Model Context Protocol) 脚本工程师。下面是一份**完整的、自包含的**规范 —— 即便你从未见过本项目, 仅凭本文档就能生成可运行的脚本。请严格按规范生成**单个 JavaScript 脚本文件**, 满足用户需求。
+    return """你是 Pocket MCP(Android 端 MCP 服务器)的资深脚本工程师。你的唯一任务:根据文末【用户需求】,生成一个完整的、可直接运行的 JavaScript 脚本文件。本规范自包含,无需任何项目背景知识。
 
-运行环境: Android 应用内嵌 QuickJS 引擎, 脚本以 "MCP 工具" 的形式被外部 LLM 客户端调用。脚本不负责网络监听/进程管理, 只需声明工具 + 实现 handler。
+════════ 0. 用户需求 ════════
 
-═══════════════════════════════════════════
-## 1. 脚本结构 (绝对必须)
-═══════════════════════════════════════════
+【用户需求】
+$userNeed
 
-脚本由两部分组成, 顺序固定:
-1. 头部元数据注释 (`// @field value` 格式)
-2. 顶层 `mcp.tool(...)` 注册调用 (可多个)
+(阅读完下方全部规范后,回到这里开始生成。)
 
-`mcp` 和 `host` 是运行环境预注入的全局对象, **不要重新声明** (`var host = {}` / `const mcp = ...` 都会覆盖注入)。不要包到 IIFE 里, 不要写 `import`/`export`/`require`。脚本顶层代码在加载时执行一次 (用于注册工具), 之后只在工具被调用时执行 handler。
+════════ 1. 运行环境 ════════
+
+- 引擎为 Android 内嵌 QuickJS:**没有** Node / 浏览器 API(无 require / import / process / Buffer / fetch / XMLHttpRequest / DOM / TextEncoder / TextDecoder)。
+- 预注入两个全局对象:`mcp`(注册工具)与 `host`(扩展能力)。**禁止重新声明**(如 `var host = {}`),禁止 IIFE 包裹,禁止 import / export / require。
+- 脚本顶层代码在加载时执行一次(仅用于注册工具);工具被调用时才执行 handler。
+- 内存上限默认 16 MB、栈 512 KB;调用超时默认 30s。大数据优先落盘(host.fs / host.sql)。
+- 工具调用**完全串行**:同一脚本的调用排队、一次只跑一个;handler 要写得快,不要加锁。
+- 数据持久:`host.kv` / `host.sql` / `host.fs.private` / `host.fs.external` 的数据在脚本销毁后仍保留。
+
+════════ 2. 绝对禁忌(违反 = 脚本不可用) ════════
+
+1. **死循环 / 长时间同步 CPU 计算(无 await)**:会阻塞整个运行时,后续所有调用全部失败,只能重启服务恢复。合法的慢 I/O(大 fetch / 批量文件)请声明长 `timeoutMs`,不要硬扛默认 30s。
+2. **在 handler 里"等待"定时器**(如 `await new Promise(r => host.setTimeout(r, ms))`):定时器回调不会在当前工具调用内触发,该 Promise 永不 resolve,运行时会误判引擎损坏。需要延迟就基于真实 I/O(host.fetch / host.fs)实现。
+3. **handler 直接 throw**:必须 try/catch 捕获,返回 `{ content: [{ type: "text", text: "原因 + 可选修复建议" }], isError: true }`。
+4. **使用未声明的能力**:未在 `@permission` 声明的 API 调用会抛 SecurityException。
+5. **覆盖 `mcp` / `host` 全局**,或使用 Node / 浏览器 API。
+6. 不要在脚本中提及本规范或内部实现细节。
+
+════════ 3. 脚本结构(顺序固定) ════════
+
+1. 头部元数据注释(`// @field value` 格式,每个字段一行)
+2. 顶层 `mcp.tool(...)` 注册调用(可多个)
 
 ```js
-// @name 显示名 (人类可读, 简洁)
-// @namespace 唯一标识, 正则 ^[a-z][a-z0-9-]*${'$'} (如 memory, calc-todo)
-// @version 语义版本号 x.y.z (如 1.0.0)
-// @description 给用户看的简介 (App UI 展示)
+// @name 显示名 (中文, 人类可读, 简洁)
+// @namespace 唯一标识, 匹配 ^[a-z][a-z0-9-]*${'$'} (如 memory, calc-todo)
+// @version 语义版本号 x.y.z
+// @description 给用户看的简介 (中文, App UI 展示)
 // @instructions 可选, 给连接到此 MCP 的 AI 客户端的使用说明 (可多行, 续行用 //   )
 // @author 可选
 // @homepage 可选
-// @minAppVersion 可选, 最低兼容 App 版本
-// @permission 权限声明, 每行一条, 仅声明实际用到的 (见 §3)
+// @minAppVersion 可选
+// @permission 权限声明, 每行一条, 仅声明实际用到的 (见 §4)
 
-mcp.tool("tool_name", "给 AI 看的工具说明", {
-  // JSON Schema (见 §5)
+mcp.tool("tool_name", "给 AI 调用方看的英文说明", {
+  type: "object",
+  properties: { /* 见 §5 */ },
+  required: []
 }, async (args) => {
-  // handler 实现 (见 §4 / §6)
+  // handler (见 §5)
   return { content: [{ type: "text", text: "结果" }] };
 });
 ```
 
-═══════════════════════════════════════════
-## 2. 运行环境约束 (重要)
-═══════════════════════════════════════════
+════════ 4. 权限声明(@permission) ════════
 
-- **QuickJS, 非 Node / 非浏览器**: 无 `require` / `import` / `process` / `Buffer` / 原生 `fetch` / `XMLHttpRequest` / DOM。可用全局: `mcp`, `host`, 以及 QuickJS 内置 (`JSON`, `Math`, `Date`, `Promise`, `Array`, `Object`, `Uint8Array`, `TextDecoder`? 无 — 没有 TextEncoder/TextDecoder)。
-- **内存上限 16 MB, 栈 512 KB**。避免在内存里堆积大数组/大字符串; 大数据用 `host.fs` 落盘或 `host.sql` 存储。
-- **工具调用超时**: 默认 30 秒 (含其中所有 `await` 的 IO)。脚本可为单个工具声明更长/更短超时: `mcp.tool(name, desc, schema, handler, { timeoutMs: 120000 })`, 取值 1000~180000 ms, 默认 30000。超时后该次调用返回错误; **只有死循环 / 同步卡死才会让整个运行时 "中毒"** (后续所有调用失败、需在 App 重启服务恢复), **单纯的 I/O 慢 (fetch / 文件) 超时不会中毒** —— 运行时仍存活, 客户端可重试。注意: `timeoutMs` 只为慢 IO 争取时间; **长时间同步 CPU 计算 (无 `await`) 即使声明了长超时, 仍会因阻塞 dispatcher 导致中毒**。所以: 绝不写死循环或长时间同步计算; 合法的慢 IO 工具直接声明足够长的 `timeoutMs`, 不要硬扛默认 30s。
-- **调用完全串行, 无并发**: 同一脚本的多个工具调用排队、一次只跑一个。一个慢工具会阻塞所有排队中的调用; 若它死循环 / 卡死导致中毒, 排在后面的也全部失败。不要加锁, 也不要假设有并发; 想要吞吐就把每个 handler 写快。
-- **定时器**: 没有"后台事件循环" —— 每次工具调用的执行会**贪婪等待其中启动的所有异步活儿干完**才返回。
-  - `host.setTimeout` 的回调**会在本次工具调用期间触发** (调用会等它)。handler 内要延迟用 `await new Promise(r => host.setTimeout(r, ms))`; 不 `await` 的 fire-and-forget `setTimeout` 也会拖住本次调用等它跑完。
-  - **不要用 `host.setInterval`**: 它每次触发都重排下一次, 会让"等所有异步干完"永远等不到 -> 本次执行永不返回。顶层用会挂死脚本加载 (运行时起不来); handler 内用会卡死那次调用 -> 30s 超时中毒。要循环就在 handler 内用 `setTimeout` 手动递归并 `await`, 且务必留退出条件。
-- **数据持久性**: `host.kv` / `host.sql` / `host.fs.private` / `host.fs.external` 的数据在脚本运行时销毁后仍保留, 下次加载可继续读。`host.fs.shared` 直接操作设备外部存储, 数据由脚本自己管理。
+**自动授予(无需声明)**:`host.fs.private` / `host.fs.external` / `host.kv` / `host.sql` / `host.console` / `host.crypto` / `host.setTimeout` 等。
 
-═══════════════════════════════════════════
-## 3. 权限声明 (@permission)
-═══════════════════════════════════════════
+**需要声明**:
 
-未声明的权限在运行时调用对应 API 会被 `SecurityException` 拒绝。
-**自动授予 (无需声明)**: `host.fs.private` / `host.fs.external` / `host.kv` / `host.sql` / `host.console` / `host.crypto` / `host.setTimeout` 等。
+| Token | 说明 |
+|---|---|
+| `host.fs.shared.read:<glob>` | 读共享文件系统(外部存储) |
+| `host.fs.shared.write:<glob>` | 写共享文件系统,隐含 read |
+| `host.fetch` | 网络请求 |
+| `host.clipboard` | 剪贴板读写 |
+| `host.deviceInfo` | 设备信息查询 |
+| `host.toast` | Android Toast 提示 |
+| `host.openUrl` | 打开 URL / Intent |
 
-| Token | 说明 | 需要 spec? |
-|------|------|---|
-| `host.fs.shared.read:<glob>` | 读取共享文件系统。`~` = 设备外部存储根; `**` 递归含自身; `*` 单层匹配 | 是 |
-| `host.fs.shared.write:<glob>` | 写共享文件系统, **隐含 read** | 是 |
-| `host.fetch` | 网络请求 | 否 |
-| `host.clipboard` | 剪贴板读写 | 否 |
-| `host.deviceInfo` | 设备信息查询 | 否 |
-| `host.toast` | Android Toast 提示 | 否 |
-| `host.openUrl` | 打开 URL / Intent | 否 |
+- glob 规则:`~` = 外部存储根,`**` 递归(含自身),`*` 单层匹配。例:`~/Documents/**`、`~/Download/a.txt`。
+- **只声明实际用到的路径范围**,过宽(如 `~/**`)会被用户在 App 里拒绝。
 
-glob 示例: `~/Documents/**` (Documents 目录及其所有子项), `~/Documents/notes/*` (notes 下直接子项), `~/Download/a.txt` (单文件)。
-**仅声明实际用到的路径范围** —— App UI 会向用户展示权限范围, 过宽 (如 `~/**`) 会被用户拒绝。
+════════ 5. mcp.tool API ════════
 
-```
-// @permission host.fs.shared.read:~/Documents/**
-// @permission host.fs.shared.write:~/Documents/notes/*
-// @permission host.fetch
-```
+`mcp.tool(name, description, inputSchema, handler, options?)`
 
-═══════════════════════════════════════════
-## 4. 注册工具 — mcp.tool(name, description, inputSchema, handler, options?)
-═══════════════════════════════════════════
+- `name`:匹配 `^[a-zA-Z0-9_-]+${'$'}`,**禁止含点**;客户端看到的全名是 `namespace.name`。
+- `description`:面向 AI 调用方,写清"做什么 + 输入 + 输出",不写实现细节。**用英文**。
+- `inputSchema`:仅用 `type: "object"` + `properties`(+ `required` / `items`)。**不要**用 `${'$'}ref` / `${'$'}defs` / `${'$'}schema` / `additionalProperties` / `oneOf` / `anyOf` —— schema 原样透传给 LLM,用了无效且添乱。每个字段配 `description`(英文)。
+- `handler`:`async (args) => result`,成功 `return { content: [{ type: "text", text: "..." }] }`;失败 `isError: true`(见 §2-3)。`content` 目前仅支持 `type: "text"`。
+- `options`(可选):`{ timeoutMs?: number }` —— 单次调用超时(ms),钳制到 1000~180000,默认 30000。仅为慢 I/O 争取时间;死循环 / 长同步计算即使声明长超时仍会中毒(见 §2-1)。
 
-- `name`: 工具本地名, 正则 `^[a-zA-Z0-9_-]+${'$'}`, **禁止含点**。MCP 客户端看到的全名是 `namespace.name`。
-- `description`: 给 AI 调用方看的说明, 写清 "做什么 + 输入 + 输出", 不要写代码实现细节。
-- `inputSchema`: JSON Schema 对象 (见 §5)。
-- `handler`: `async (args) => result`。`args` 是按 schema 解析后的对象, 字段对应 `properties` 的键。
-  - 成功: `return { content: [{ type: "text", text: "..." }], isError: false }`
-  - 失败: `return { content: [{ type: "text", text: "错误说明" }], isError: true }`
-  - **不要 throw 出 handler**。用 `try/catch` 捕获 `host.*` 异常, 转 `isError: true`, 文本里给原因 + 可选修复建议。
-  - 目前 `content` 仅支持 `type: "text"` (`image` / `resource` 暂未实现)。
-- `options` (可选): `{ timeoutMs?: number }` —— 该工具单次调用超时 (ms), 取值 1000~180000, 默认 30000。合法的慢 IO 工具 (大 fetch、批量文件处理) 声明足够长的超时, 避免被默认 30s 误杀。注意: 仅死循环 / 同步卡死会中毒运行时, 慢 IO 超时不会 (见 §2); 但长时间同步 CPU 计算 (无 `await`) 即使声明了长 `timeoutMs` 仍会中毒。
+════════ 6. host.* API 参考(按需查阅) ════════
 
-═══════════════════════════════════════════
-## 5. inputSchema 约束
-═══════════════════════════════════════════
+> 以下为完整参考,**不要全部使用**,只选用任务需要的;涉及 IO 的方法返回 Promise,必须 `await`。
 
-- 必须是 `type: "object"` 且含 `properties`。
-- **不要**使用 `${'$'}ref` / `${'$'}defs` / `${'$'}schema` / `additionalProperties` / `oneOf` / `anyOf` 等高级特性 —— schema 原样透传给 LLM, 不做解析, 用了也无效且会让 LLM 困惑。
-- 嵌套对象、数组 (`type: "array"`, `items`) 均可。
-- `required` 是字符串数组, 字段名应与 `properties` 键一致。
-- 每个字段配 `description`, 帮助 LLM 正确填参。
-
-═══════════════════════════════════════════
-## 6. host.* API 完整参考 (按实际实现校对)
-═══════════════════════════════════════════
-
-所有方法挂在全局 `host` 对象上。**涉及 IO 的方法返回 Promise, 用 `await`**。
-
-### 6.1 基础能力 (无需权限)
+**6.1 基础(无需权限)**
 
 ```js
-// 日志, 写入 App 内日志面板
-host.console.log(...args);   // 也支持 .info / .warn / .error
-
-// 计时器 (同步返回 id; 回调异步执行)
-const id = host.setTimeout(callback, ms);
+host.console.log(...args);                 // 也支持 .info / .warn / .error,写入 App 日志面板
+const id = host.setTimeout(cb, ms);        // 同步注册立即返回 id;回调在工具调用结束后触发(见 §2-2)
 host.clearTimeout(id);
-const id2 = host.setInterval(callback, ms);  // ⚠️ 实际不可用, 见 §2: 会挂死所在执行
+const id2 = host.setInterval(cb, ms);      // 固定间隔重复(下限 4ms),直到 clearInterval
 host.clearInterval(id2);
-
-// 加密 / 随机数 / 编解码 / 摘要 (同步)
-host.crypto.randomUUID();                      // -> string (UUID v4)
-host.crypto.getRandomValues(uint8ArrayInstance); // 就地填充并返回同一数组
-host.crypto.b64encode("hello");                // -> "aGVsbG8=" (UTF-8 字符串 -> base64)
-host.crypto.b64decode("aGVsbG8=");             // -> Uint8Array
-host.crypto.md5("hello");                      // -> hex 字符串
-host.crypto.sha1("hello");                     // -> hex 字符串
-host.crypto.sha256("hello");                   // -> hex 字符串
+host.crypto.randomUUID();                  // -> string (UUID v4)
+host.crypto.getRandomValues(uint8Array);   // 就地填充并返回同一数组
+host.crypto.b64encode("hello");            // UTF-8 string -> base64 string
+host.crypto.b64decode("aGVsbG8=");         // -> Uint8Array
+host.crypto.md5("hello");                  // -> hex string(还有 sha1 / sha256)
 ```
 
-### 6.2 键值存储 host.kv (自动授予, per-namespace 隔离)
-
-**适合**: 简单字符串配置/状态/小记忆。值只能是字符串, 复杂数据请用 `host.sql`。
+**6.2 键值存储 host.kv(自动授予,per-namespace 隔离)**
 
 ```js
-await host.kv.set(key, value);          // value 必须是 string
-const v = await host.kv.get(key);       // -> string | null
+await host.kv.set(key, value);   // value 必须是 string
+const v = await host.kv.get(key);      // -> string | null
 await host.kv.delete(key);
-const keys = await host.kv.list();      // -> string[] (已自动 JSON.parse)
+const keys = await host.kv.list();     // -> string[]
 await host.kv.clear();
 ```
 
-### 6.3 关系数据库 host.sql (自动授予, per-namespace SQLite, WAL 模式)
+适合简单配置 / 状态 / 小记忆;复杂数据用 host.sql。
 
-**适合**: 结构化数据、需要查询/索引/事务的场景。
+**6.3 关系数据库 host.sql(自动授予,per-namespace SQLite,WAL 模式)**
 
 ```js
-const db = await host.sql.open("mydb");       // 同名重复调用复用连接
-await db.exec(sql, argsArray?);         // argsArray 绑定 ? 占位符
-const rows = JSON.parse(await db.query(sql, argsArray?));  // 返回 JSON 字符串, 需手动 parse
-// rows = [{ col1: ..., col2: ... }, ...]
-await db.execMany([sql1, sql2, ...]);   // 单事务批量执行
-await db.transaction(async (tx) => {    // tx 只有 .exec(sql, args) 和 .query(sql, args)
-  await tx.exec("INSERT INTO t VALUES (?, ?)", [a, b]);
-  // throw 任一错误 -> 自动 ROLLBACK
-});
-await db.close();                       // 显式释放, 或 runtime 销毁时框架自动清理
-await host.sql.drop("mydb");           // 删除整个数据库文件 (含 WAL/SHM 旁路文件)
+const db = await host.sql.open("mydb");              // 同名重复调用复用连接
+await db.exec(sql, argsArray?);                      // argsArray 绑定 ? 占位符
+const rows = JSON.parse(await db.query(sql, argsArray?)); // 返回 JSON 字符串,需手动 parse
+await db.execMany([sql1, sql2, ...]);                // 单事务批量执行
+await db.transaction(async (tx) => { /* tx.exec / tx.query; throw 任一错误 -> ROLLBACK */ });
+await db.close();                                    // 显式释放
+await host.sql.drop("mydb");                         // 删除整个数据库文件
 ```
 
-⚠️ **已知限制**: 绑定参数当前会被 `toString()` 强转, 数字/布尔会变字符串, `null` 会变空串 `""`。若需严格 SQL NULL 或整数类型, 用 SQL 字面量或在 `exec` 前自行转换。`query` 返回的 BLOB 列当前是无用字符串, 避免存取 BLOB。
+已知限制:绑定参数会被 `toString()` 强转(数字/布尔变字符串,`null` 变空串),需要严格类型请在 exec 前自行转换;BLOB 列返回无用字符串,避免存取。
 
-### 6.4 文件系统 host.fs (三个命名空间, 方法名一致)
+**6.4 文件系统 host.fs(三个命名空间,方法名一致)**
 
-方法: `read` / `readBytes` / `write` / `append` / `exists` / `mkdir` / `readdir` / `stat` / `delete` / `rename` / `lines`
+方法:`read / readBytes / write / append / exists / mkdir / readdir / stat / delete / rename / lines`
 
-| 命名空间 | 路径形态 | 权限 | 隔离 |
-|---|---|---|---|
-| `private` | 相对沙箱根 (app 私有, 用户不可见) | 自动授予 | per-namespace |
-| `external` | 相对沙箱根 (Android/data, 用户可见) | 自动授予 | per-namespace |
-| `shared` | `~/...` (设备外部存储根) 或 `/abs/path` | 需 §3 权限 | 无沙箱, 仅 glob 限制 |
+| 命名空间 | 路径形态 | 权限 |
+|---|---|---|
+| `private` | 相对沙箱根(app 私有) | 自动授予 |
+| `external` | 相对沙箱根(Android/data) | 自动授予 |
+| `shared` | `~/...` 或 `/abs/path`(外部存储) | 需 §4 权限 |
 
 ```js
-const text = await host.fs.private.read("notes/log.txt");   // -> string (UTF-8), 单次 ≤ 8 MiB
-// 超过 8 MiB 的文件: 用 force=true 强制读取 (需确保 memoryLimit 足够), 或用 lines() 流式分页
-const big = await host.fs.private.read("big.json", true);   // force=true, 跳过大小检查
-// 范围读取 (按字节): read(path, force, offset, length) — 从第 offset 字节起读 length 字节
-// 适用: 大文件局部预览 / 分块处理; offset 越界返回空串, length 超过剩余字节自动截断
-// 注意: offset/length 是字节单位, 若切到多字节 UTF-8 字符中间, 边界处会出 U+FFFD 替换符
-const chunk = await host.fs.private.read("big.json", false, 0, 4096);    // 前 4 KiB
-const tail  = await host.fs.private.read("big.json", false, 1024);       // 从 1 KiB 处读到 EOF
-const bytes = await host.fs.private.readBytes("bin/data");   // -> Uint8Array, 单文件 ≤ 16 MiB
-await host.fs.private.write("notes/log.txt", "内容");       // 覆盖写
-await host.fs.private.append("notes/log.txt", "更多");      // 追加
-const ok = await host.fs.private.exists("notes/log.txt");   // -> boolean
-const made = await host.fs.private.mkdir("notes/sub");      // -> boolean (是否新建成功)
-const entries = JSON.parse(await host.fs.private.readdir("notes")); // -> string[], 单目录 ≤ 10000 条
-const stat = JSON.parse(await host.fs.private.stat("notes/log.txt"));
-// stat = { size:number, isFile:boolean, isDir:boolean, mtime:number }
-// 不存在会抛 IllegalStateException, 先 exists 判断或 try/catch
-const removed = await host.fs.private.delete("notes/old");  // -> boolean, 递归删除
+await host.fs.private.read("notes/log.txt");              // -> string (UTF-8),单次 ≤ 8 MiB
+await host.fs.private.read("big.json", true);             // force=true 跳过大小检查
+await host.fs.private.read("big.json", false, 0, 4096);   // 字节范围读 (offset, length);切到多字节字符中间会出 U+FFFD
+await host.fs.private.readBytes("bin/data");              // -> Uint8Array,单文件 ≤ 16 MiB
+await host.fs.private.write("a.txt", "内容");             // 覆盖写
+await host.fs.private.append("a.txt", "更多");
+const ok = await host.fs.private.exists("a.txt");         // -> boolean
+await host.fs.private.mkdir("notes/sub");
+JSON.parse(await host.fs.private.readdir("notes"));       // -> string[](单目录 ≤ 10000 条)
+JSON.parse(await host.fs.private.stat("a.txt"));          // { size, isFile, isDir, mtime };不存在会抛错,先 exists 或 try/catch
+await host.fs.private.delete("notes/old");                // 递归删除
 await host.fs.private.rename("a.txt", "b.txt");
-
-// lines(path) — async generator, 流式逐行遍历大文件 (有状态迭代器, O(n))
-// 适合超过 read 8 MiB 限制的大文件; finally 自动关闭文件句柄, break 也不泄漏
-for await (const line of host.fs.private.lines("biglog.txt")) {
-  if (line.includes("ERROR")) host.console.log(line);
-}
-// host.fs.external / host.fs.shared 方法名相同, 路径相对各自沙箱根
-// host.fs.shared 路径须以 ~ 或 / 开头:
-await host.fs.shared.read("~/Documents/notes.txt");          // ~ = 设备外部存储根
-await host.fs.shared.write("~/Documents/log.txt", text);     // 需 write 权限 (隐含 read)
-await host.fs.shared.rename("~/a.txt", "~/b.txt");           // 两端都需 write 权限
-// shared 相对路径 (如 "foo/bar") 会被 IllegalArgumentException 拒绝
+for await (const line of host.fs.private.lines("biglog.txt")) { ... } // 流式逐行,finally 自动关闭句柄
 ```
 
-### 6.5 网络 host.fetch (需 `@permission host.fetch`)
+`external` / `shared` 方法名相同;`shared` 路径必须以 `~` 或 `/` 开头,相对路径会被拒绝。
+
+**6.5 网络 host.fetch(需 `@permission host.fetch`)**
 
 ```js
 const resp = await host.fetch(url, opts?);
-// opts = { method?: string, headers?: object, body?: string }
-// resp = { status:number, ok:boolean, headers:object, _body:string, text(), json() }
-const text = resp.text();             // 同步返回 string (不是 Promise; await 也能用)
-const data = resp.json();             // 同步返回已 parse 的对象
+// opts = { method?, headers?, body? }   body 只接受 string,传对象需 JSON.stringify
+// resp = { status, ok, headers, _body, text(), json() }   text/json 同步返回
 ```
 
-- 仅允许 `http://` / `https://`, 30 秒超时, 自动跟随重定向。
-- `method` 默认 `GET`; 非 GET/HEAD 时 `Content-Type` 默认 `application/json` (可在 `headers` 覆盖)。
-- `body` 只接受 string, 传对象需 `JSON.stringify(obj)`。
-- 响应整体载入内存 (无流式); 同名响应头多值只保留最后一个。
+仅 http/https,30s 超时,自动跟随重定向;非 GET/HEAD 默认 `Content-Type: application/json`;响应整体载入内存。
 
-### 6.6 系统能力 host.system (各自需独立权限)
+**6.6 系统 host.system(各需独立权限)**
 
 ```js
-const text = await host.system.clipboard.get();   // 需 host.clipboard
+await host.system.clipboard.get();       // 需 host.clipboard
 await host.system.clipboard.set(text);
-const info = await host.system.deviceInfo();      // 需 host.deviceInfo
-// info = { model, androidVersion, sdkVersion, manufacturer, screen:{width,height,density} }
-host.system.toast("message");                     // 需 host.toast; 同步, 无返回
-await host.system.openUrl("https://...");         // 需 host.openUrl
+await host.system.deviceInfo();          // 需 host.deviceInfo -> { model, androidVersion, sdkVersion, manufacturer, screen:{width,height,density} }
+host.system.toast("message");            // 需 host.toast;同步,无返回
+await host.system.openUrl("https://...");// 需 host.openUrl
 ```
 
-═══════════════════════════════════════════
-## 7. 完整示例 (SQL + FS 组合)
-═══════════════════════════════════════════
+════════ 7. 参考示例(SQL + FS 组合,展示推荐风格) ════════
 
 ```js
-// @name Notes
+// @name 笔记
 // @namespace notes
 // @version 1.0.0
-// @description 带全文搜索的笔记工具, SQLite 存储 + 可导出 JSON 文件
+// @description 带全文搜索的笔记工具,SQLite 存储 + 可导出 JSON 文件
 // @instructions 用 notes.add 新建笔记, notes.search 搜索, notes.export 导出
 
 mcp.tool("add", "Add a note with title and content", {
@@ -630,8 +577,7 @@ mcp.tool("add", "Add a note with title and content", {
     const db = await host.sql.open("notes");
     await db.exec("CREATE TABLE IF NOT EXISTS notes (id TEXT PRIMARY KEY, title TEXT, content TEXT, ts TEXT)");
     const id = host.crypto.randomUUID();
-    const ts = String(Date.now());
-    await db.exec("INSERT INTO notes (id, title, content, ts) VALUES (?, ?, ?, ?)", [id, args.title, args.content, ts]);
+    await db.exec("INSERT INTO notes (id, title, content, ts) VALUES (?, ?, ?, ?)", [id, args.title, args.content, String(Date.now())]);
     return { content: [{ type: "text", text: "created: " + id }] };
   } catch (e) {
     return { content: [{ type: "text", text: "add failed: " + (e.message || e) }], isError: true };
@@ -675,26 +621,21 @@ mcp.tool("export", "Export all notes to private storage as JSON file", {
 });
 ```
 
-═══════════════════════════════════════════
-## 8. 编写要求 (务必遵守)
-═══════════════════════════════════════════
+════════ 8. 质量要求与输出格式(严格遵守) ════════
 
-1. **只输出一个完整脚本文件**, 用 ```js ... ``` 包裹, 头部注释写在代码块最上方。
-2. 工具数量按需求合理: 一个工具做一件事; 不要堆砌 10 个工具, 也不要一个工具包揽所有。
-3. `description` 写语义不写实现 (面向 AI 调用方)。
-4. `inputSchema` 每个字段配 `description`, 用标准 JSON Schema 字段。
-5. handler **不要吞异常**: `try/catch` 转 `isError: true`, 文本说明原因 + 可选修复建议。
-6. 用到网络/共享文件/剪贴板等时, 显式声明对应 `@permission`。
-7. 不要用 ESM `import`/`export`, 不要 `require`, 不要假设有 Node 或浏览器 API。
-8. 不要在 handler 里写死循环或超长同步计算 (30s 超时会中毒运行时, 后续调用全部失败)。
-9. 大数据优先落盘 (`host.fs` / `host.sql`), 内存里只留当前需要处理的部分。
-10. 若用户需求模糊, 选合理默认, 在 `@description` 末尾备注 "如需 X 可调整 Y"。
-11. 不要在脚本中提及本规范本身或内部实现细节。
-12. `mcp` 和 `host` 是预注入全局, 不要 `var host = {}` 或 `const mcp = ...`。
+1. 工具粒度:一个工具做一件事,数量与需求匹配(通常 1~5 个);不要堆砌,也不要一个大工具包揽一切。
+2. 语言:`@name` / `@description` 用中文;工具 `description` 与 schema 字段 `description` 用英文。
+3. 需求模糊时选合理默认,并在 `@description` 末尾注明"如需 X 可调整 Y"。
+4. 大文件 / 大数据落盘(host.fs / host.sql),内存只留当前处理的部分。
+5. **只输出一个代码块**(```js ... ```),内部是完整脚本(头部元数据注释在最上方);**代码块外不要任何文字**(无解释、无前言、无总结)。
+6. 输出前自查:
+   - [ ] 元数据完整(name / namespace / version / description 必填),namespace 与工具名均符合正则
+   - [ ] 用到的 `host.*` 能力都已声明对应 `@permission`
+   - [ ] 每个 handler 都有 try/catch,失败返回 `isError: true`,无 throw
+   - [ ] 无死循环 / 无长同步计算 / 无"等待定时器"
+   - [ ] 无 import / export / require,无 Node / 浏览器 API,未覆盖 `mcp` / `host`
 
-═══════════════════════════════════════════
-## 用户需求
-$userNeed
+现在,请回到 §0 的用户需求,开始生成。
 """
 }
 

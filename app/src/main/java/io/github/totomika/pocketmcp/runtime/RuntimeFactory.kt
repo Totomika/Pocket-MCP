@@ -78,8 +78,9 @@ class RuntimeFactory(
      *
      * 事件循环泵 (M2.4) 已移除: quickjs-kt 的 evaluate 内部 awaitAsyncJobs 是贪婪的,
      * 会自己 join 所有活跃 async job (含新调度的), 已构成事实上的事件循环。
-     * 工具回调由 callHandler 的 evaluate 直接驱动, 无需外部泵 (见 EventLoopPumpSpikeTest)。
-     * 已知限制: 顶层 setInterval 会让 evaluate 永不返回 (见 spike_a2)。
+     * 工具回调由 callHandler 的 evaluate 直接驱动, 无需外部泵。
+     * 定时器 (host.setTimeout / host.setInterval) 已改为 Kotlin 驱动 (见 HostApiInjector):
+     * 顶层注册也立即返回, 不再有旧版"setInterval 挂死 evaluate"的限制 (见 TimerMechanicsTest)。
      */
     fun startBackgroundJobs(entry: RuntimeEntry) {
         // 健康检查 (M2.5): 每 30s 探针, 连续 3 次失败标记 poisoned
