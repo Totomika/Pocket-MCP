@@ -7,10 +7,12 @@ import io.github.totomika.pocketmcp.R
 import io.github.totomika.pocketmcp.app.container
 import io.github.totomika.pocketmcp.mcp.ServiceEntry
 import io.github.totomika.pocketmcp.script.ScriptEntry
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * 导出配置的目标客户端格式。
@@ -87,7 +89,10 @@ class ServiceDetailViewModel(app: Application) : AndroidViewModel(app) {
 
     fun toggleScript(serviceId: String, namespace: String, enabled: Boolean) {
         viewModelScope.launch {
-            serviceManager.toggleScriptEnabled(serviceId, namespace, enabled)
+            // 服务运行中 toggle 会 rebuildTools → acquire → evaluate, 不能在 Main 线程跑
+            withContext(Dispatchers.Default) {
+                serviceManager.toggleScriptEnabled(serviceId, namespace, enabled)
+            }
             refreshScriptDetails(serviceId)
         }
     }
@@ -95,7 +100,10 @@ class ServiceDetailViewModel(app: Application) : AndroidViewModel(app) {
     fun start(serviceId: String) {
         viewModelScope.launch {
             try {
-                serviceManager.startService(serviceId)
+                // 启动链路含 acquire → evaluate (可能死循环) + 中毒重建探测, 不能跑 Main
+                withContext(Dispatchers.Default) {
+                    serviceManager.startService(serviceId)
+                }
                 _isRunning.value = true
                 refreshScriptDetails(serviceId)
             } catch (e: Exception) {
@@ -107,7 +115,10 @@ class ServiceDetailViewModel(app: Application) : AndroidViewModel(app) {
     fun stop(serviceId: String) {
         viewModelScope.launch {
             try {
-                serviceManager.stopService(serviceId)
+                // 停止链路含 release → destroy (中毒时探测最多 2s), 不能跑 Main
+                withContext(Dispatchers.Default) {
+                    serviceManager.stopService(serviceId)
+                }
                 _isRunning.value = false
                 refreshScriptDetails(serviceId)
             } catch (e: Exception) {
@@ -118,7 +129,10 @@ class ServiceDetailViewModel(app: Application) : AndroidViewModel(app) {
 
     fun deleteService(serviceId: String, onDone: () -> Unit) {
         viewModelScope.launch {
-            serviceManager.deleteService(serviceId)
+            // 删除链路含 stopServiceInternal → release → destroy, 同上不能跑 Main
+            withContext(Dispatchers.Default) {
+                serviceManager.deleteService(serviceId)
+            }
             onDone()
         }
     }

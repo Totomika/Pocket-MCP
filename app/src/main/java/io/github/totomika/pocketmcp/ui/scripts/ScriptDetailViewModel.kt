@@ -13,10 +13,12 @@ import io.github.totomika.pocketmcp.R
 import io.github.totomika.pocketmcp.runtime.RuntimeFactory
 import io.github.totomika.pocketmcp.script.RuntimeConfig
 import io.github.totomika.pocketmcp.script.ScriptEntry
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 data class ToolInfo(val name: String, val description: String)
 data class ServiceRef(
@@ -165,7 +167,10 @@ class ScriptDetailViewModel(app: Application) : AndroidViewModel(app) {
             val total = _services.value.count { it.isRunning }
             _isRestarting.value = true
             try {
-                val started = serviceManager.restartServicesForScript(ns)
+                // 重启链路 = stop + start (acquire → evaluate + 中毒重建探测), 不能跑 Main
+                val started = withContext(Dispatchers.Default) {
+                    serviceManager.restartServicesForScript(ns)
+                }
                 _showRestartDialog.value = false
                 _message.value = getApplication<Application>().getString(R.string.services_restarted, started, total)
             } catch (e: Exception) {
@@ -201,11 +206,15 @@ class ScriptDetailViewModel(app: Application) : AndroidViewModel(app) {
 
     fun uninstall(namespace: String, deleteData: Boolean, purgeLogs: Boolean, onDone: () -> Unit) {
         viewModelScope.launch {
-            val restarted = scriptManager.uninstallScript(
-                namespace,
-                purgeData = deleteData,
-                purgeLogs = purgeLogs
-            )
+            // uninstallScript 链路含 restartServicesForScript (stop+start → evaluate),
+            // 不能在 Main 线程跑
+            val restarted = withContext(Dispatchers.Default) {
+                scriptManager.uninstallScript(
+                    namespace,
+                    purgeData = deleteData,
+                    purgeLogs = purgeLogs
+                )
+            }
             _message.value =
                 if (restarted > 0) getApplication<Application>().getString(R.string.uninstalled_with_restart, restarted) else getApplication<Application>().getString(R.string.uninstalled)
             onDone()
