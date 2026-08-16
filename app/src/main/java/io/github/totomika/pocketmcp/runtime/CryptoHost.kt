@@ -1,6 +1,5 @@
 package io.github.totomika.pocketmcp.runtime
 
-import com.dokar.quickjs.QuickJs
 import com.dokar.quickjs.binding.function
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -20,8 +19,6 @@ import java.util.UUID
  * - Base64 用 `java.util.Base64` (JDK 自带), 不再自写 JS 解码器 —— 顺带修复
  *   原 FsApi `_b64dec` 的两个缺陷 (c<64 guard 无效 / 畸形输入 RangeError)。
  * - 摘要用 `java.security.MessageDigest`, 输出 hex 小写。
- *
- * 见 docs/03-host-api.md 第 0 层。
  */
 object CryptoHost {
 
@@ -30,15 +27,18 @@ object CryptoHost {
      *
      * 单次注入即可 (第 0 层每 runtime 只注入一次), JS 侧 `host.crypto = { ... }`
      * 直接赋值, 不需要 `||` guard。
+     *
+     * 注入期 evaluate 经 [RuntimeEntry.runJs] 派发; function binding 注册是
+     * define 操作, 不执行 JS, 直接用 [RuntimeEntry.quickJs]。
      */
-    fun inject(quickJs: QuickJs) {
+    suspend fun inject(entry: RuntimeEntry) {
         val random = SecureRandom()
 
         // --- 随机数 ---
-        quickJs.function<String>("__crypto_randomUUID") {
+        entry.quickJs.function<String>("__crypto_randomUUID") {
             UUID.randomUUID().toString()
         }
-        quickJs.function<ByteArray>("__crypto_randomValues") { args ->
+        entry.quickJs.function<ByteArray>("__crypto_randomValues") { args ->
             val length = (args.firstOrNull() as? Number)?.toInt() ?: 0
             val bytes = ByteArray(length)
             random.nextBytes(bytes)
@@ -47,33 +47,33 @@ object CryptoHost {
 
         // --- Base64 (RFC 4648) ---
         // encode: 接受 UTF-8 字符串 -> base64 字符串
-        quickJs.function<String>("__crypto_b64encode") { args ->
+        entry.quickJs.function<String>("__crypto_b64encode") { args ->
             val input = args.firstOrNull()?.toString() ?: ""
             Base64.getEncoder().encodeToString(input.toByteArray(Charsets.UTF_8))
         }
         // decode: base64 字符串 -> ByteArray (JS 侧包装为 Uint8Array)
-        quickJs.function<ByteArray>("__crypto_b64decode") { args ->
+        entry.quickJs.function<ByteArray>("__crypto_b64decode") { args ->
             val input = args.firstOrNull()?.toString() ?: ""
             Base64.getDecoder().decode(input)
         }
 
         // --- 摘要 -> hex 小写 ---
-        quickJs.function<String>("__crypto_md5") { args ->
+        entry.quickJs.function<String>("__crypto_md5") { args ->
             val input = args.firstOrNull()?.toString() ?: ""
             hashHex("MD5", input.toByteArray(Charsets.UTF_8))
         }
-        quickJs.function<String>("__crypto_sha1") { args ->
+        entry.quickJs.function<String>("__crypto_sha1") { args ->
             val input = args.firstOrNull()?.toString() ?: ""
             hashHex("SHA-1", input.toByteArray(Charsets.UTF_8))
         }
-        quickJs.function<String>("__crypto_sha256") { args ->
+        entry.quickJs.function<String>("__crypto_sha256") { args ->
             val input = args.firstOrNull()?.toString() ?: ""
             hashHex("SHA-256", input.toByteArray(Charsets.UTF_8))
         }
 
         // --- JS 包装层 ---
-        kotlinx.coroutines.runBlocking {
-            quickJs.evaluate<Any?>(
+        entry.runJs {
+            evaluate<Any?>(
                 """
                 if (typeof host === 'undefined') { var host = {}; }
                 host.crypto = {

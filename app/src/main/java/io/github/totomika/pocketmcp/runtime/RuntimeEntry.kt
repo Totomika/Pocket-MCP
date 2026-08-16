@@ -1,4 +1,4 @@
-﻿package io.github.totomika.pocketmcp.runtime
+package io.github.totomika.pocketmcp.runtime
 
 import android.util.Log
 import com.dokar.quickjs.MemoryUsage
@@ -23,11 +23,13 @@ import java.util.concurrent.RejectedExecutionException
  *
  * @property namespace 脚本唯一标识
  * @property quickJs QuickJS 实例
- * @property dispatcher 单线程 dispatcher, 串行化所有 JS 调用
+ * @property dispatcher runtime 专属单线程 dispatcher。它本身并不串行化任何 JS 调用
+ *   —— JS 只会跑在这个线程上, 是因为所有入口都经由 [runJs] 派发 (quickjs-kt 的
+ *   evaluate 拿 jsMutex 后在调用方线程执行 native JS, 单线程保证靠封装而非调度器)
  * @property toolRegistry 已注册的工具 (本地名 → 工具定义)
  * @property scope 该 runtime 的协程作用域, 销毁时 cancel
- * @property callQueue 串行化队列 (FIFO, 深度 8), 排队 tools/call 请求
- * @property healthChecker 健康检查 Job (M2.5)
+ * @property callQueue 并发上限队列 (FIFO, 深度 8), 限制同时 in-flight 的 tools/call
+ * @property healthChecker 健康检查 Job
  */
 data class RuntimeEntry(
     val namespace: String,
@@ -47,13 +49,40 @@ data class RuntimeEntry(
     var onDestroy: (() -> Unit)? = null
 
     /**
-     * 中毒标记: 工具调用超时后标记为 true, 后续调用直接拒绝。
+     * 中毒原因; null = 未中毒。
      *
      * 死循环脚本会卡住 dispatcher 线程, withTimeout 虽然取消协程,
      * 但 native JS 执行无法中断。标记中毒避免后续调用排队等待。
      */
     @Volatile
-    var poisoned: Boolean = false
+    private var _poisonReason: PoisonReason? = null
+
+    /** 是否已中毒 (任何原因)。 */
+    val poisoned: Boolean get() = poisonReason != null
+
+    /** 中毒原因; null = 未中毒。 */
+    val poisonReason: PoisonReason? get() = _poisonReason
+
+    /**
+     * 标记中毒。首个诊断者获胜 (最初的原因最可信, 后续来源不覆盖)。
+     */
+    @Synchronized
+    fun poison(reason: PoisonReason) {
+        if (_poisonReason == null) {
+            _poisonReason = reason
+        }
+    }
+
+    /**
+     * 所有 JS 执行的唯一入口: 将 [block] 派发到 runtime 专属线程后执行。
+     *
+     * 不变量: 除本函数外, 任何代码不得直接调用 quickJs.evaluate。
+     * 一旦 JS 在其它线程上运行, "dispatcher 空闲 ⟹ jsMutex 空闲"的探测前提被破坏,
+     * [safeCloseQuickJs] 对 close() 的安全判断会失效 (自旋卡死)。
+     * 新增 JS 入口时必须经由本函数, 这是封装层强制约束, 不靠调用点自律。
+     */
+    suspend fun <T> runJs(block: suspend QuickJs.() -> T): T =
+        withContext(dispatcher) { quickJs.block() }
 
     /**
      * 当前内存使用情况。
@@ -77,45 +106,43 @@ data class RuntimeEntry(
      */
     suspend fun destroy() {
         withContext(NonCancellable) {
-            onDestroy?.invoke()
+            // onDestroy (host API 资源清理) 失败仅记录, 不得中断销毁流程
+            runCatching { onDestroy?.invoke() }.onFailure {
+                Log.w("RuntimeEntry", "onDestroy cleanup failed for '$namespace'", it)
+            }
             healthChecker?.cancel()
             scope.cancel()
             callQueue.close()
-            if (poisoned) {
-                // 中毒已由 ToolBridge 的 2s 探针确认 dispatcher 卡死, 无需再探测, 直接孤儿化
-                orphanLog("poisoned")
+            if (poisonReason == PoisonReason.STUCK_DISPATCHER) {
+                // 已由 ToolBridge 探针确认 dispatcher 被死循环占用, 无需再探测, 直接孤儿化
+                OrphanLedger.onOrphaned(namespace, "stuck dispatcher (poisoned)")
             } else if (safeCloseQuickJs(quickJs, dispatcher)) {
                 // 仅当 close 成功 (dispatcher 空闲) 才关闭线程池; 孤儿化时线程仍被死循环占用
                 (dispatcher as? ExecutorCoroutineDispatcher)?.close()
             } else {
-                orphanLog("dispatcher probe timeout")
+                OrphanLedger.onOrphaned(namespace, "dispatcher probe timeout")
             }
         }
     }
 
-    /** 孤儿化时打警告日志 (泄漏的是死循环线程, 进程死亡时回收)。 */
-    private fun orphanLog(reason: String) {
-        Log.w(
-            "RuntimeEntry",
-            "Runtime '$namespace' orphaned ($reason): leaked thread + native ctx, " +
-                "reclaimed at process death. This is the price of an uninterruptible " +
-                "JS infinite loop (quickjs-kt has no JS_SetInterruptHandler)."
-        )
-    }
-
     companion object {
-        /** 串行化队列深度 (docs/05-runtime.md: FIFO, 深度 8) */
+        /** 串行化队列深度 (FIFO, 深度 8) */
         const val QUEUE_DEPTH = 8
     }
 }
 
 /**
- * dispatcher 忙闲探测超时 (ms)。
- *
- * 中毒重建/销毁路径上, 探测会阻塞调用方 (含 RuntimeManager.mutex) 最多这么久。
- * 2s 与 ToolBridge 的探针超时 (PROBE_TIMEOUT_MS) 量级一致, 避免正常慢 I/O 误判。
+ * 毒化原因。此前用单一 Boolean 建模, "dispatcher 已确认卡死"与"引擎损坏但线程空闲"
+ * 这类资源状态完全不同的情形共用同一处理 (一律孤儿化), 会白白泄漏空闲线程。
  */
-internal const val DISPATCHER_PROBE_TIMEOUT_MS = 2_000L
+enum class PoisonReason {
+    /** 工具调用超时 + 探针确认 dispatcher 被死循环占用 (线程救不回, 销毁时直接孤儿化) */
+    STUCK_DISPATCHER,
+    /** QuickJS async 基础设施损坏 (死 promise / 引擎级异常), dispatcher 多半仍空闲 (销毁时先探测, 可正常回收线程) */
+    BRIDGE_CORRUPTED,
+    /** 健康检查连续失败 (探针超时或内存超限) */
+    HEALTH_CHECK_FAILED,
+}
 
 /**
  * 安全关闭 QuickJs: 探测 dispatcher 空闲则正常 close, 忙 (死循环持锁) 则跳过走孤儿化。
@@ -123,9 +150,11 @@ internal const val DISPATCHER_PROBE_TIMEOUT_MS = 2_000L
  * 说明: "dispatcher 空闲 ⟹ jsMutex 空闲"并非严格不变量 —— asyncFunction 的
  * resolve/reject 会在非 dispatcher 线程 (resumption 线程, 如 IO) 短暂获取 jsMutex
  * (µs 级 native resolve, 有界持有)。因此 dispatcher 空闲只保证 jsMutex 空闲或仅被
- * 有界持有, close() 的自旋等它无妨; 真正导致永久卡死的持有者永远是 dispatcher 上
- * 运行的死循环 evaluate, 探测可捕获。探测任务排在 dispatcher 队列尾部: 若线程被
- * 死循环占用, 探测挂起, withTimeoutOrNull 超时返回 null → 判定忙, 不碰 close()。
+ * 有界持有, close() 的自旋等它无妨; 真正导致永久卡死的是 dispatcher 上运行的死循环
+ * evaluate, 探测可捕获。该推理依赖 runJs 强制的"JS 只在 dispatcher 线程执行"不变量
+ * —— 若有人在其它线程直接 evaluate 且死循环, 本函数会误判空闲并自旋。探测任务排在
+ * dispatcher 队列尾部: 若线程被死循环占用, 探测挂起, withTimeoutOrNull 超时返回
+ * null → 判定忙, 不碰 close()。
  *
  * @param quickJs 可能为 null (create 早期失败), null 视为无需关闭
  * @return true = 已完整关闭; false = 孤儿化 (native 资源随进程消亡, 调用方不被阻塞)
@@ -136,7 +165,7 @@ internal suspend fun safeCloseQuickJs(
 ): Boolean {
     if (quickJs == null || quickJs.isClosed) return true
     val idle = try {
-        withTimeoutOrNull(DISPATCHER_PROBE_TIMEOUT_MS) {
+        withTimeoutOrNull(RuntimePolicy.PROBE_TIMEOUT_MS) {
             withContext(dispatcher) { true }
         } == true
     } catch (e: RejectedExecutionException) {

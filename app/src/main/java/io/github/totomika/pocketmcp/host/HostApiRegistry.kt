@@ -1,9 +1,8 @@
-﻿package io.github.totomika.pocketmcp.host
+package io.github.totomika.pocketmcp.host
 
-import com.dokar.quickjs.QuickJs
 import io.github.totomika.pocketmcp.data.fs.FsPathManager
 import io.github.totomika.pocketmcp.permission.SystemPermissionChecker
-import kotlinx.coroutines.CoroutineScope
+import io.github.totomika.pocketmcp.runtime.RuntimeEntry
 
 /**
  * 统一注册所有 host.* API。
@@ -17,9 +16,9 @@ class HostApiRegistry(
     /**
      * 注入所有 API。
      */
-    fun injectAll(quickJs: QuickJs, namespace: String, scope: CoroutineScope) {
+    suspend fun injectAll(entry: RuntimeEntry, namespace: String) {
         for (api in apis) {
-            api.inject(quickJs, namespace, scope)
+            api.inject(entry, namespace)
         }
     }
 
@@ -34,12 +33,12 @@ class HostApiRegistry(
 
     companion object {
         /**
-         * 创建默认的 API 列表 (M3 完整 + M4 权限检查)。
+         * 创建默认的 API 列表。
          *
          * @param context Android Context (kv/sql/fs/system 需要)
-         * @param fsPermissionChecker fs.global 权限检查 (M4, null 时跳过)
-         * @param fetchPermissionChecker fetch 权限检查 (M4, null 时跳过)
-         * @param systemPermissionChecker system 权限检查 (M4, null 时跳过)
+         * @param fsPermissionChecker fs.global 权限检查 (null 时跳过)
+         * @param fetchPermissionChecker fetch 权限检查 (null 时跳过)
+         * @param systemPermissionChecker system 权限检查 (null 时跳过)
          */
         fun createDefault(
             pathManager: FsPathManager,

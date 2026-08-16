@@ -3,10 +3,8 @@ package io.github.totomika.pocketmcp
 import com.dokar.quickjs.QuickJs
 import io.github.totomika.pocketmcp.runtime.HostApiInjector
 import io.github.totomika.pocketmcp.runtime.QuickJsBridge
+import io.github.totomika.pocketmcp.runtime.RuntimeEntry
 import io.github.totomika.pocketmcp.runtime.RuntimeFactory
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.newSingleThreadContext
 import kotlinx.coroutines.runBlocking
@@ -29,21 +27,28 @@ import org.junit.Test
  * 新实现把"重复"移出 JS 异步 job, 那些旧行为不再成立, 故整套替换。
  *
  * 在 Android 设备/模拟器上运行 (QuickJs native lib 需要 Android)。
+ * JS 执行统一经 [RuntimeEntry.runJs] (与主代码不变量一致)。
  */
 class TimerMechanicsTest {
+
+    /** 构造仅含第 0 层 host API 的独立 runtime (不走 RuntimeFactory, 保持测试最小化)。 */
+    private suspend fun createBareEntry(namespace: String): RuntimeEntry {
+        val dispatcher = newSingleThreadContext(namespace)
+        val quickJs = QuickJs.create(dispatcher)
+        val entry = RuntimeEntry(namespace = namespace, quickJs = quickJs, dispatcher = dispatcher)
+        HostApiInjector.inject(entry, namespace, null)
+        return entry
+    }
 
     /**
      * 顶层 setInterval: 注册即返回 (不挂死加载), 之后按间隔重复触发。
      */
     @Test
     fun setInterval_top_level_does_not_hang_and_fires() = runBlocking {
-        val dispatcher = newSingleThreadContext("tl1")
-        val quickJs = QuickJs.create(dispatcher)
-        val scope = CoroutineScope(SupervisorJob())
-        HostApiInjector.inject(quickJs, scope, dispatcher, "tl1", null)
+        val entry = createBareEntry("tl1")
         try {
             val start = System.nanoTime()
-            quickJs.evaluate<Any?>("var count = 0; host.setInterval(() => { count++; }, 50);")
+            entry.runJs { evaluate<Any?>("var count = 0; host.setInterval(() => { count++; }, 50);") }
             val loadElapsed = (System.nanoTime() - start) / 1_000_000L
             assertTrue(
                 "顶层 setInterval 注册应立即返回, 不阻塞加载 (实际 ${loadElapsed}ms)",
@@ -51,42 +56,37 @@ class TimerMechanicsTest {
             )
 
             delay(130) // ~2 次 tick (50ms, 100ms)
-            val count = quickJs.evaluate<String>("String(count)").toLong()
+            val count = entry.runJs { evaluate<String>("String(count)") }.toLong()
             assertTrue("130ms 内 interval 应至少触发 2 次, 实际 $count", count >= 2L)
         } finally {
-            quickJs.close()
-            scope.cancel()
-            dispatcher.close()
+            entry.destroy()
         }
     }
 
     /**
-     * 顶层 setTimeout: 注册即返回 (不阻塞加载); 到点后回调触发一次。
+     * 顶层 setTimeout: 注册即返回 (不挂死加载); 到点后回调触发一次。
      */
     @Test
     fun setTimeout_top_level_does_not_block_load_and_fires_once() = runBlocking {
-        val dispatcher = newSingleThreadContext("tl2")
-        val quickJs = QuickJs.create(dispatcher)
-        val scope = CoroutineScope(SupervisorJob())
-        HostApiInjector.inject(quickJs, scope, dispatcher, "tl2", null)
+        val entry = createBareEntry("tl2")
         try {
             val start = System.nanoTime()
-            quickJs.evaluate<Any?>(
-                "globalThis.__fired = false; host.setTimeout(() => { globalThis.__fired = true; }, 200);"
-            )
+            entry.runJs {
+                evaluate<Any?>(
+                    "globalThis.__fired = false; host.setTimeout(() => { globalThis.__fired = true; }, 200);"
+                )
+            }
             val loadElapsed = (System.nanoTime() - start) / 1_000_000L
             assertTrue("顶层 setTimeout 注册应立即返回 (实际 ${loadElapsed}ms)", loadElapsed < 100L)
 
-            val before = quickJs.evaluate<String>("String(globalThis.__fired)")
+            val before = entry.runJs { evaluate<String>("String(globalThis.__fired)") }
             assertTrue("200ms 未到, 回调不应已触发: $before", before.contains("false"))
 
             delay(250)
-            val after = quickJs.evaluate<String>("String(globalThis.__fired)")
+            val after = entry.runJs { evaluate<String>("String(globalThis.__fired)") }
             assertTrue("250ms 后回调应已触发: $after", after.contains("true"))
         } finally {
-            quickJs.close()
-            scope.cancel()
-            dispatcher.close()
+            entry.destroy()
         }
     }
 
@@ -116,11 +116,11 @@ class TimerMechanicsTest {
                 elapsed < 100L && res.contains("ok"),
             )
 
-            val before = entry.quickJs.evaluate<String>("String(globalThis.__fired === true)")
+            val before = entry.runJs { evaluate<String>("String(globalThis.__fired === true)") }
             assertTrue("工具刚返回, 回调不应已触发: $before", before.contains("false"))
 
             delay(250)
-            val after = entry.quickJs.evaluate<String>("String(globalThis.__fired === true)")
+            val after = entry.runJs { evaluate<String>("String(globalThis.__fired === true)") }
             assertTrue("250ms 后回调应已触发: $after", after.contains("true"))
         } finally {
             entry.destroy()
@@ -132,27 +132,24 @@ class TimerMechanicsTest {
      */
     @Test
     fun clearInterval_stops_repeating() = runBlocking {
-        val dispatcher = newSingleThreadContext("tl4")
-        val quickJs = QuickJs.create(dispatcher)
-        val scope = CoroutineScope(SupervisorJob())
-        HostApiInjector.inject(quickJs, scope, dispatcher, "tl4", null)
+        val entry = createBareEntry("tl4")
         try {
             // interval 50ms, 120ms 后用 setTimeout 清掉
-            quickJs.evaluate<Any?>(
-                "var count = 0; " +
-                    "const id = host.setInterval(() => { count++; }, 50); " +
-                    "host.setTimeout(() => host.clearInterval(id), 120);"
-            )
+            entry.runJs {
+                evaluate<Any?>(
+                    "var count = 0; " +
+                        "const id = host.setInterval(() => { count++; }, 50); " +
+                        "host.setTimeout(() => host.clearInterval(id), 120);"
+                )
+            }
             delay(300)
-            val c1 = quickJs.evaluate<String>("String(count)").toLong()
+            val c1 = entry.runJs { evaluate<String>("String(count)") }.toLong()
             delay(300)
-            val c2 = quickJs.evaluate<String>("String(count)").toLong()
+            val c2 = entry.runJs { evaluate<String>("String(count)") }.toLong()
             assertTrue("clear 前应至少触发 2 次: $c1", c1 >= 2L)
             assertTrue("clearInterval 后 count 不应继续增长 (c1=$c1, c2=$c2)", c1 == c2)
         } finally {
-            quickJs.close()
-            scope.cancel()
-            dispatcher.close()
+            entry.destroy()
         }
     }
 }

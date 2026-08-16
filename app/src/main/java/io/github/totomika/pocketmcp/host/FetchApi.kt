@@ -1,8 +1,7 @@
-﻿package io.github.totomika.pocketmcp.host
+package io.github.totomika.pocketmcp.host
 
-import com.dokar.quickjs.QuickJs
 import com.dokar.quickjs.binding.asyncFunction
-import kotlinx.coroutines.CoroutineScope
+import io.github.totomika.pocketmcp.runtime.RuntimeEntry
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -27,7 +26,7 @@ import java.util.concurrent.TimeUnit
  * const ok = response.ok
  * ```
  *
- * 权限: 需声明 @permission host.fetch (M4 检查, 这里只实现网络逻辑)。
+ * 权限: 需声明 @permission host.fetch (这里只实现网络逻辑)。
  * 限制: 只允许 http/https, 30s 超时, 自动重定向(最多5次)。
  */
 class FetchApi(
@@ -42,9 +41,9 @@ class FetchApi(
             .build()
     }
 
-    override fun inject(quickJs: QuickJs, namespace: String, scope: CoroutineScope) {
+    override suspend fun inject(entry: RuntimeEntry, namespace: String) {
         // fetch(url, options?) → JSON { status, ok, body, headers }
-        quickJs.asyncFunction<String>("__fetch") { args ->
+        entry.quickJs.asyncFunction<String>("__fetch") { args ->
             val url = args[0]?.toString() ?: ""
             val options = args[1]
 
@@ -53,7 +52,7 @@ class FetchApi(
                 throw IllegalArgumentException("Only http/https schemes are allowed")
             }
 
-            // 权限检查 (M4 接入)
+            // 权限检查
             permissionChecker?.check(namespace, url)
 
             val (method, headers, body) = parseOptions(options)
@@ -90,8 +89,8 @@ class FetchApi(
             }
         }
 
-        kotlinx.coroutines.runBlocking {
-            quickJs.evaluate<Any?>(
+        entry.runJs {
+            evaluate<Any?>(
                 """
                 if (typeof host === 'undefined') { var host = {}; }
                 host.fetch = async function(url, options) {
@@ -140,7 +139,7 @@ class FetchApi(
 }
 
 /**
- * Fetch 权限检查接口 (M4 实现)。
+ * Fetch 权限检查接口。
  */
 interface FetchPermissionChecker {
     fun check(namespace: String, url: String)

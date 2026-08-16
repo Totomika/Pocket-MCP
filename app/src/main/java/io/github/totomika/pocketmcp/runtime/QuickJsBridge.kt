@@ -1,21 +1,17 @@
-﻿package io.github.totomika.pocketmcp.runtime
-
-import kotlinx.coroutines.withContext
+package io.github.totomika.pocketmcp.runtime
 
 /**
  * 协程 ↔ Promise 桥接。
  *
  * Kotlin → JS: evaluate async IIFE 包裹 handler, await Promise, 返回结果 JSON。
  * JS → Kotlin: 通过 asyncFunction binding, 返回 Promise。
- *
- * 见 docs/05-runtime.md "协程 ↔ Promise 桥接" + docs/06-mcp-protocol.md "工具注册桥接详解"。
  */
 class QuickJsBridge {
 
     /**
      * 调用 JS handler 并返回结果 JSON 字符串。
      *
-     * 在 runtime 的 dispatcher 上执行 (串行化)。
+     * 经 [RuntimeEntry.runJs] 在 runtime 专属线程上执行 (JS 只跑在 dispatcher 线程)。
      *
      * 注意: quickjs-kt 的 evaluate 返回 evaluation 的直接结果。
      * async IIFE 返回 Promise 对象, 不是 resolved value。
@@ -37,7 +33,7 @@ class QuickJsBridge {
         runtime: RuntimeEntry,
         toolName: String,
         argsJson: String,
-    ): String = withContext(runtime.dispatcher) {
+    ): String = runtime.runJs {
         // 第一次 evaluate: 启动 async IIFE, 结果存全局 __bridge_result
         // evaluate 会 awaitAsyncJobs, 等 Promise resolve 后返回
         val launchCode = """
@@ -56,11 +52,11 @@ class QuickJsBridge {
             })();
         """.trimIndent()
         try {
-            runtime.quickJs.evaluate<Any?>(launchCode)
+            evaluate<Any?>(launchCode)
         } catch (e: Exception) {
             // 第一个 evaluate 抛异常 = QuickJS 引擎级损坏 (OOM, "Result promise not found" 等)
             // JS 层错误已被 IIFE 的 try-catch 兜住, 不会到这。到这里的都是引擎级故障。
-            runtime.poisoned = true
+            runtime.poison(PoisonReason.BRIDGE_CORRUPTED)
             throw e
         }
 
@@ -72,11 +68,11 @@ class QuickJsBridge {
             }
             globalThis.__bridge_result
         """.trimIndent()
-        val result = runtime.quickJs.evaluate<Any?>(resultCode)
+        val result = evaluate<Any?>(resultCode)
         if (result == null) {
             // __bridge_result 为 null 说明 async IIFE 没正常完成
             // (handler 卡在死 promise 上 — QuickJS async 基础设施已损坏)
-            runtime.poisoned = true
+            runtime.poison(PoisonReason.BRIDGE_CORRUPTED)
             throw IllegalStateException(
                 "Bridge result is null — QuickJS async infrastructure may be corrupted " +
                         "(tool=$toolName). Runtime marked as poisoned."

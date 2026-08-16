@@ -1,6 +1,7 @@
 package io.github.totomika.pocketmcp
 
 import com.dokar.quickjs.QuickJsException
+import io.github.totomika.pocketmcp.runtime.PoisonReason
 import io.github.totomika.pocketmcp.runtime.QuickJsBridge
 import io.github.totomika.pocketmcp.runtime.RuntimeFactory
 import io.github.totomika.pocketmcp.runtime.RuntimeManager
@@ -47,7 +48,7 @@ class RuntimeHangAndLeakTest {
         // 等死循环跑起来 (evaluate 已进入 while(true), jsMutex 被持有)
         delay(500)
         // 标记中毒 (模拟 ToolBridge 超时 + 探针失败后的结论)
-        entry.poisoned = true
+        entry.poison(PoisonReason.STUCK_DISPATCHER)
 
         val start = System.nanoTime()
         entry.destroy()
@@ -93,7 +94,7 @@ class RuntimeHangAndLeakTest {
             }
         }
         delay(500)
-        entry.poisoned = true
+        entry.poison(PoisonReason.STUCK_DISPATCHER)
 
         val start = System.nanoTime()
         // acquire 触发重建: destroy 旧 (孤儿化, 无 probe) + create 新
