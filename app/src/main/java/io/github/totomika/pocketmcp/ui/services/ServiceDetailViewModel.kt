@@ -7,12 +7,10 @@ import io.github.totomika.pocketmcp.R
 import io.github.totomika.pocketmcp.app.container
 import io.github.totomika.pocketmcp.mcp.ServiceEntry
 import io.github.totomika.pocketmcp.script.ScriptEntry
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 /**
  * 导出配置的目标客户端格式。
@@ -89,10 +87,15 @@ class ServiceDetailViewModel(app: Application) : AndroidViewModel(app) {
 
     fun toggleScript(serviceId: String, namespace: String, enabled: Boolean) {
         viewModelScope.launch {
-            // 服务运行中 toggle 会 rebuildTools → acquire → evaluate, 不能在 Main 线程跑
-            withContext(Dispatchers.Default) {
+            try {
                 serviceManager.toggleScriptEnabled(serviceId, namespace, enabled)
+            } catch (e: Exception) {
+                _message.value = application.getString(
+                    R.string.toggle_script_failed,
+                    e.message ?: application.getString(R.string.error_unknown)
+                )
             }
+            // manifest 已变更 (无论 rebuildTools 是否成功), 刷新反映真实状态
             refreshScriptDetails(serviceId)
         }
     }
@@ -100,10 +103,7 @@ class ServiceDetailViewModel(app: Application) : AndroidViewModel(app) {
     fun start(serviceId: String) {
         viewModelScope.launch {
             try {
-                // 启动链路含 acquire → evaluate (可能死循环) + 中毒重建探测, 不能跑 Main
-                withContext(Dispatchers.Default) {
-                    serviceManager.startService(serviceId)
-                }
+                serviceManager.startService(serviceId)
                 _isRunning.value = true
                 refreshScriptDetails(serviceId)
             } catch (e: Exception) {
@@ -115,10 +115,7 @@ class ServiceDetailViewModel(app: Application) : AndroidViewModel(app) {
     fun stop(serviceId: String) {
         viewModelScope.launch {
             try {
-                // 停止链路含 release → destroy (中毒时探测最多 2s), 不能跑 Main
-                withContext(Dispatchers.Default) {
-                    serviceManager.stopService(serviceId)
-                }
+                serviceManager.stopService(serviceId)
                 _isRunning.value = false
                 refreshScriptDetails(serviceId)
             } catch (e: Exception) {
@@ -129,9 +126,13 @@ class ServiceDetailViewModel(app: Application) : AndroidViewModel(app) {
 
     fun deleteService(serviceId: String, onDone: () -> Unit) {
         viewModelScope.launch {
-            // 删除链路含 stopServiceInternal → release → destroy, 同上不能跑 Main
-            withContext(Dispatchers.Default) {
+            try {
                 serviceManager.deleteService(serviceId)
+            } catch (e: Exception) {
+                _message.value = application.getString(
+                    R.string.delete_service_failed,
+                    e.message ?: application.getString(R.string.error_unknown)
+                )
             }
             onDone()
         }
@@ -180,13 +181,18 @@ class ServiceDetailViewModel(app: Application) : AndroidViewModel(app) {
     /** 批量添加脚本到服务。 */
     fun addScripts(serviceId: String, namespaces: List<String>) {
         viewModelScope.launch {
-            // 服务运行中 addScriptToService 会 rebuildTools → acquire → evaluate, 不能在 Main 线程跑
-            withContext(Dispatchers.Default) {
+            try {
                 for (namespace in namespaces) {
                     val code = scriptRepository.readScriptCode(namespace) ?: continue
                     serviceManager.addScriptToService(serviceId, namespace, code, enabled = true)
                 }
+            } catch (e: Exception) {
+                _message.value = application.getString(
+                    R.string.add_scripts_failed,
+                    e.message ?: application.getString(R.string.error_unknown)
+                )
             }
+            // manifest 已变更 (无论 rebuildTools 是否成功), 刷新反映真实状态
             refreshScriptDetails(serviceId)
         }
     }
@@ -194,10 +200,15 @@ class ServiceDetailViewModel(app: Application) : AndroidViewModel(app) {
     /** 从服务移除脚本。 */
     fun removeScript(serviceId: String, namespace: String) {
         viewModelScope.launch {
-            // 服务运行中 removeScriptFromService 会 rebuildTools → acquire → evaluate, 不能在 Main 线程跑
-            withContext(Dispatchers.Default) {
+            try {
                 serviceManager.removeScriptFromService(serviceId, namespace)
+            } catch (e: Exception) {
+                _message.value = application.getString(
+                    R.string.remove_script_failed,
+                    e.message ?: application.getString(R.string.error_unknown)
+                )
             }
+            // manifest 已变更 (无论 rebuildTools 是否成功), 刷新反映真实状态
             refreshScriptDetails(serviceId)
         }
     }

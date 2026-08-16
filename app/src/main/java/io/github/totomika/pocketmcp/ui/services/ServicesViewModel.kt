@@ -1,4 +1,4 @@
-﻿package io.github.totomika.pocketmcp.ui.services
+package io.github.totomika.pocketmcp.ui.services
 
 import android.app.Application
 import android.util.Log
@@ -8,7 +8,6 @@ import io.github.totomika.pocketmcp.R
 import io.github.totomika.pocketmcp.app.container
 import io.github.totomika.pocketmcp.mcp.ServiceEntry
 import io.github.totomika.pocketmcp.script.ScriptEntry
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -16,7 +15,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 /**
  * 服务列表项的汇总信息。
@@ -127,11 +125,8 @@ class ServicesViewModel(app: Application) : AndroidViewModel(app) {
     fun startService(id: String) {
         viewModelScope.launch {
             try {
-                // 启动链路含 acquire → evaluate, 可能遇到脚本顶层死循环 (evaluate 永不返回)
-                // 或中毒重建的 destroy 探测 (最多 2s), 不能在 Main 线程跑 (会 ANR)。
-                withContext(Dispatchers.Default) {
-                    serviceManager.startService(id)
-                }
+                // manager 内部已切换到 IO dispatcher, Main 调用安全
+                serviceManager.startService(id)
                 _runningIds.value = _runningIds.value + id
             } catch (e: Exception) {
                 _message.value = application.getString(R.string.start_service_failed, e.message ?: application.getString(R.string.error_unknown))
@@ -142,10 +137,8 @@ class ServicesViewModel(app: Application) : AndroidViewModel(app) {
     fun stopService(id: String) {
         viewModelScope.launch {
             try {
-                // 停止链路含 release → destroy (中毒时探测最多 2s), 同上不能在 Main 线程跑
-                withContext(Dispatchers.Default) {
-                    serviceManager.stopService(id)
-                }
+                // manager 内部已切换到 IO dispatcher, Main 调用安全
+                serviceManager.stopService(id)
                 _runningIds.value = _runningIds.value - id
             } catch (e: Exception) {
                 _message.value = application.getString(R.string.stop_service_failed, e.message ?: application.getString(R.string.error_unknown))
@@ -167,15 +160,11 @@ class ServicesViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 val actualPort = port ?: _previewPort.value
                 ?: throw IllegalStateException(application.getString(R.string.no_port_available, portRangeHint))
-                // 创建 + 映射脚本: 服务运行中 addScriptToService 会 rebuildTools → acquire → evaluate,
-                // 同样不能在 Main 线程跑 (见 startService 注释)
-                val service = withContext(Dispatchers.Default) {
-                    val svc = serviceManager.createService(name, actualPort)
-                    for (namespace in selectedNamespaces) {
-                        val code = scriptRepository.readScriptCode(namespace) ?: continue
-                        serviceManager.addScriptToService(svc.id, namespace, code, enabled = true)
-                    }
-                    svc
+                // manager 内部已切换到 IO dispatcher, Main 调用安全
+                val service = serviceManager.createService(name, actualPort)
+                for (namespace in selectedNamespaces) {
+                    val code = scriptRepository.readScriptCode(namespace) ?: continue
+                    serviceManager.addScriptToService(service.id, namespace, code, enabled = true)
                 }
                 reload()
                 _message.value = application.getString(R.string.service_created, service.name)

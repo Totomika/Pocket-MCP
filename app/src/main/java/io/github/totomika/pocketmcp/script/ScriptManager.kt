@@ -1,10 +1,13 @@
-﻿package io.github.totomika.pocketmcp.script
+package io.github.totomika.pocketmcp.script
 
 import io.github.totomika.pocketmcp.data.log.LogDao
 import io.github.totomika.pocketmcp.mcp.ServiceManager
 import io.github.totomika.pocketmcp.mcp.ServiceManifestStore
 import io.github.totomika.pocketmcp.permission.PermissionDeclaration
 import io.github.totomika.pocketmcp.permission.PermissionManager
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * 脚本管理器。
@@ -15,7 +18,9 @@ import io.github.totomika.pocketmcp.permission.PermissionManager
  * Service 关联清理走 [ServiceManifestStore] + [ServiceManager.restartServicesForScript];
  * 日志清理走 [LogDao.deleteByNamespace]。
  *
- * 见 docs/08-distribution.md。
+ * 线程模型: 所有 suspend 公共方法内部切换到 [ioDispatcher], 调用方无需关心线程。
+ * import/uninstall 链路含文件 IO + 网络请求 + restartServicesForScript (内部再走
+ * runtime acquire → evaluate), 必然离开 Main —— 本封装保证这一点。
  *
  * 流程:
  * 1. 导入: 解析元数据 → 校验 → 存储代码 → 写 manifest → 导入权限 → 注册脚本代码缓存
@@ -31,6 +36,7 @@ class ScriptManager(
     private val serviceManager: ServiceManager,
     private val logDao: LogDao,
     private val urlImporter: UrlImporter = UrlImporter(),
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) {
 
     /**
@@ -70,19 +76,19 @@ class ScriptManager(
         code: String,
         sourceType: ScriptSourceType,
         sourceUrl: String? = null,
-    ): ImportResult {
+    ): ImportResult = withContext(ioDispatcher) {
         // 1. 解析并校验元数据
         val metadata = try {
             ScriptMetadataParser.parseAndValidate(code)
         } catch (e: IllegalArgumentException) {
-            return ImportResult.Error(e.message ?: "Invalid metadata")
+            return@withContext ImportResult.Error(e.message ?: "Invalid metadata")
         }
 
         // 2. 检查是否已存在同 namespace (以 manifest 是否存在为准)
         val existingManifest = manifestStore.read(metadata.namespace)
         if (existingManifest != null) {
             val existing = existingManifest.metadata.toEntry()
-            return when {
+            return@withContext when {
                 VersionUtils.isSame(metadata.version, existing.version) -> {
                     ImportResult.SameVersion(existing)
                 }
@@ -128,7 +134,7 @@ class ScriptManager(
         // 5. 注册脚本代码到 ServiceManager 代码缓存 (供后续手动新建服务时使用)
         serviceManager.registerScriptCode(metadata.namespace, code)
 
-        return ImportResult.Imported(savedEntry)
+        ImportResult.Imported(savedEntry)
     }
 
     /**
@@ -142,7 +148,7 @@ class ScriptManager(
         namespace: String,
         newCode: String,
         sourceUrl: String? = null,
-    ): ScriptEntry {
+    ): ScriptEntry = withContext(ioDispatcher) {
         val metadata = ScriptMetadataParser.parseAndValidate(newCode)
         val existingManifest = manifestStore.read(namespace)
             ?: throw IllegalStateException("Script not found: $namespace")
@@ -173,7 +179,7 @@ class ScriptManager(
         // 5. 重启运行该脚本的服务, 让新代码生效 (refcount 归零 → 重新 evaluate)
         serviceManager.restartServicesForScript(namespace)
 
-        return updated.toEntry()
+        updated.toEntry()
     }
 
     /**
@@ -206,9 +212,9 @@ class ScriptManager(
         namespace: String,
         purgeData: Boolean = false,
         purgeLogs: Boolean = false,
-    ): Int {
+    ): Int = withContext(ioDispatcher) {
         // 已卸载则直接返回 (manifest 不存在 = 未安装)
-        if (!manifestStore.exists(namespace)) return 0
+        if (!manifestStore.exists(namespace)) return@withContext 0
 
         // 1. 从所有 service manifest 移除引用此 ns 的项, 返回受影响服务
         val affected = serviceManifestStore.removeScriptFromAllServices(namespace)
@@ -239,7 +245,7 @@ class ScriptManager(
         // 7. 清理残留空目录 (manifest + src + [data] 全删后可能遗留 <ns>/ 空目录)
         repository.deleteScriptDirIfEmpty(namespace)
 
-        return restarted
+        restarted
     }
 
     /**
@@ -248,8 +254,8 @@ class ScriptManager(
      * @param url 脚本 URL
      * @return 导入结果
      */
-    suspend fun importFromUrl(url: String): ImportResult {
-        return try {
+    suspend fun importFromUrl(url: String): ImportResult = withContext(ioDispatcher) {
+        try {
             val code = urlImporter.fetch(url)
             importScript(code, ScriptSourceType.URL, url)
         } catch (e: Exception) {
@@ -266,52 +272,70 @@ class ScriptManager(
      * @return 有更新的脚本列表 (namespace → 新版本号)
      */
     suspend fun checkUrlUpdates(): List<UrlUpdateInfo> {
-        val urlScripts = manifestStore.listAll().values
-            .filter { it.metadata.sourceType == ScriptSourceType.URL.name }
-        val updates = mutableListOf<UrlUpdateInfo>()
+        return withContext(ioDispatcher) {
+            val urlScripts = manifestStore.listAll().values
+                .filter { it.metadata.sourceType == ScriptSourceType.URL.name }
+            val updates = mutableListOf<UrlUpdateInfo>()
 
-        for (manifest in urlScripts) {
-            val ns = manifest.metadata.namespace
-            val url = manifest.metadata.sourceUrl ?: continue
-            val currentVersion = manifest.metadata.scriptVersion
-            try {
-                val code = urlImporter.fetch(url)
-                val metadata = ScriptMetadataParser.parse(code) ?: continue
+            for (manifest in urlScripts) {
+                val ns = manifest.metadata.namespace
+                val url = manifest.metadata.sourceUrl ?: continue
+                val currentVersion = manifest.metadata.scriptVersion
+                try {
+                    val code = urlImporter.fetch(url)
+                    val metadata = ScriptMetadataParser.parse(code) ?: continue
 
-                if (VersionUtils.isNewer(metadata.version, currentVersion)) {
-                    updates.add(
-                        UrlUpdateInfo(
-                            namespace = ns,
-                            currentVersion = currentVersion,
-                            newVersion = metadata.version,
-                            newCode = code,
+                    if (VersionUtils.isNewer(metadata.version, currentVersion)) {
+                        updates.add(
+                            UrlUpdateInfo(
+                                namespace = ns,
+                                currentVersion = currentVersion,
+                                newVersion = metadata.version,
+                                newCode = code,
+                            )
                         )
-                    )
+                    }
+                } catch (e: Exception) {
+                    // 网络错误, 跳过此脚本
                 }
-            } catch (e: Exception) {
-                // 网络错误, 跳过此脚本
             }
-        }
 
-        return updates
+            updates
+        }
     }
 
     /**
      * 获取所有脚本 (按 namespace 升序)。
      */
-    suspend fun getAllScripts(): List<ScriptEntry> =
+    suspend fun getAllScripts(): List<ScriptEntry> = withContext(ioDispatcher) {
         manifestStore.listAll().values.map { it.metadata.toEntry() }.sortedBy { it.namespace }
+    }
 
     /**
      * 获取脚本元数据。
      */
-    suspend fun getScript(namespace: String): ScriptEntry? =
+    suspend fun getScript(namespace: String): ScriptEntry? = withContext(ioDispatcher) {
         manifestStore.read(namespace)?.metadata?.toEntry()
+    }
 
     /**
-     * 读取脚本代码。
+     * 保存脚本代码 (编辑器保存路径)。
+     *
+     * 写文件 + 更新 ServiceManager 代码缓存, 全程在 [ioDispatcher] 上执行。
+     * 取代 ViewModel 直接调 ScriptRepository (会在调用方线程做文件写) 的旧路径。
      */
-    fun readScriptCode(namespace: String): String? = repository.readScriptCode(namespace)
+    suspend fun saveScriptCode(namespace: String, code: String) {
+        withContext(ioDispatcher) {
+            repository.storeScriptCode(namespace, code)
+            serviceManager.registerScriptCode(namespace, code)
+        }
+    }
+
+    /**
+     * 读取脚本代码 (文件读, 经 [ioDispatcher] 离开调用方线程)。
+     */
+    suspend fun readScriptCode(namespace: String): String? =
+        withContext(ioDispatcher) { repository.readScriptCode(namespace) }
 }
 
 /**

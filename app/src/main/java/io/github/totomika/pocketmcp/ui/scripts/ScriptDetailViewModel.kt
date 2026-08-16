@@ -10,15 +10,12 @@ import io.github.totomika.pocketmcp.permission.PermissionEntry
 import io.github.totomika.pocketmcp.permission.PermissionParser
 import io.github.totomika.pocketmcp.permission.PermissionToken
 import io.github.totomika.pocketmcp.R
-import io.github.totomika.pocketmcp.runtime.RuntimeFactory
 import io.github.totomika.pocketmcp.script.RuntimeConfig
 import io.github.totomika.pocketmcp.script.ScriptEntry
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 data class ToolInfo(val name: String, val description: String)
 data class ServiceRef(
@@ -110,20 +107,16 @@ class ScriptDetailViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun refreshMemoryUsage(namespace: String) {
+    private suspend fun refreshMemoryUsage(namespace: String) {
         val app = getApplication<android.app.Application>()
         val runtime = app.container.runtimeManager.getRuntime(namespace)
-        if (runtime != null && !runtime.quickJs.isClosed) {
+        _memoryUsage.value = if (runtime != null && !runtime.quickJs.isClosed) {
             try {
-                val used = runtime.memoryUsage.memoryUsedSize
-                val limit = runtime.quickJs.memoryLimit
-                _memoryUsage.value = Pair(used, limit)
+                runtime.runJs { Pair(memoryUsage.memoryUsedSize, memoryLimit) }
             } catch (e: Exception) {
-                _memoryUsage.value = null
+                null
             }
-        } else {
-            _memoryUsage.value = null
-        }
+        } else null
     }
 
     fun toggleEditMode() {
@@ -141,19 +134,24 @@ class ScriptDetailViewModel(app: Application) : AndroidViewModel(app) {
     fun saveCode(namespace: String) {
         viewModelScope.launch {
             val newCode = _editCode.value
-            val app = getApplication<android.app.Application>()
-            app.container.scriptRepository.storeScriptCode(namespace, newCode)
-            serviceManager.registerScriptCode(namespace, newCode)
-            _code.value = newCode
-            _tools.value = extractTools(newCode)
-            _editMode.value = false
-            _message.value = getApplication<Application>().getString(R.string.code_saved)
+            try {
+                scriptManager.saveScriptCode(namespace, newCode)
+                _code.value = newCode
+                _tools.value = extractTools(newCode)
+                _editMode.value = false
+                _message.value = getApplication<Application>().getString(R.string.code_saved)
 
-            // 已有服务在运行该脚本时, 其 runtime 仍持有旧代码 (RuntimeManager 引用计数不会重新 evaluate)。
-            // 弹窗提示用户重启, 让 refCount 归零后重新 evaluate 新代码。
-            val hasRunning = _services.value.any { it.isRunning }
-            if (hasRunning) {
-                _showRestartDialog.value = true
+                // 已有服务在运行该脚本时, 其 runtime 仍持有旧代码 (RuntimeManager 引用计数不会重新 evaluate)。
+                // 弹窗提示用户重启, 让 refCount 归零后重新 evaluate 新代码。
+                val hasRunning = _services.value.any { it.isRunning }
+                if (hasRunning) {
+                    _showRestartDialog.value = true
+                }
+            } catch (e: Exception) {
+                _message.value = getApplication<Application>().getString(
+                    R.string.err_update_failed_with_reason,
+                    e.message ?: getApplication<Application>().getString(R.string.error_unknown)
+                )
             }
         }
     }
@@ -167,10 +165,7 @@ class ScriptDetailViewModel(app: Application) : AndroidViewModel(app) {
             val total = _services.value.count { it.isRunning }
             _isRestarting.value = true
             try {
-                // 重启链路 = stop + start (acquire → evaluate + 中毒重建探测), 不能跑 Main
-                val started = withContext(Dispatchers.Default) {
-                    serviceManager.restartServicesForScript(ns)
-                }
+                val started = serviceManager.restartServicesForScript(ns)
                 _showRestartDialog.value = false
                 _message.value = getApplication<Application>().getString(R.string.services_restarted, started, total)
             } catch (e: Exception) {
@@ -206,18 +201,21 @@ class ScriptDetailViewModel(app: Application) : AndroidViewModel(app) {
 
     fun uninstall(namespace: String, deleteData: Boolean, purgeLogs: Boolean, onDone: () -> Unit) {
         viewModelScope.launch {
-            // uninstallScript 链路含 restartServicesForScript (stop+start → evaluate),
-            // 不能在 Main 线程跑
-            val restarted = withContext(Dispatchers.Default) {
-                scriptManager.uninstallScript(
-                    namespace,
-                    purgeData = deleteData,
-                    purgeLogs = purgeLogs
+            try {
+                val restarted = scriptManager.uninstallScript(
+                    namespace, purgeData = deleteData, purgeLogs = purgeLogs
                 )
+                _message.value =
+                    if (restarted > 0) getApplication<Application>().getString(R.string.uninstalled_with_restart, restarted)
+                    else getApplication<Application>().getString(R.string.uninstalled)
+            } catch (e: Exception) {
+                _message.value = getApplication<Application>().getString(
+                    R.string.uninstall_failed,
+                    e.message ?: getApplication<Application>().getString(R.string.error_unknown)
+                )
+            } finally {
+                onDone()
             }
-            _message.value =
-                if (restarted > 0) getApplication<Application>().getString(R.string.uninstalled_with_restart, restarted) else getApplication<Application>().getString(R.string.uninstalled)
-            onDone()
         }
     }
 
@@ -271,9 +269,13 @@ class ScriptDetailViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun toggleScriptEnabled(serviceId: String, namespace: String, enabled: Boolean) {
         viewModelScope.launch {
-            // 服务运行中 toggle 会 rebuildTools → acquire → evaluate, 不能在 Main 线程跑
-            withContext(Dispatchers.Default) {
+            try {
                 serviceManager.toggleScriptEnabled(serviceId, namespace, enabled)
+            } catch (e: Exception) {
+                _message.value = getApplication<Application>().getString(
+                    R.string.toggle_script_failed,
+                    e.message ?: getApplication<Application>().getString(R.string.error_unknown)
+                )
             }
             // 刷新服务列表以反映新的运行状态
             val allServices = serviceManager.getAllServices()

@@ -1,4 +1,4 @@
-﻿package io.github.totomika.pocketmcp.ui.scripts
+package io.github.totomika.pocketmcp.ui.scripts
 
 import android.app.Application
 import android.net.Uri
@@ -8,10 +8,12 @@ import io.github.totomika.pocketmcp.R
 import io.github.totomika.pocketmcp.app.container
 import io.github.totomika.pocketmcp.script.ScriptManager
 import io.github.totomika.pocketmcp.script.ScriptSourceType
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class AddScriptViewModel(app: Application) : AndroidViewModel(app) {
     private val scriptManager = app.container.scriptManager
@@ -41,11 +43,15 @@ class AddScriptViewModel(app: Application) : AndroidViewModel(app) {
         _loading.value = true
         viewModelScope.launch {
             try {
-                val code = getApplication<Application>().contentResolver
-                    .openInputStream(uri)?.use { it.readBytes().toString(Charsets.UTF_8) }
-                    ?: throw IllegalStateException(
-                        getApplication<Application>().getString(R.string.err_cannot_read_file)
-                    )
+                // 本地文件读是 content resolver 流式读取, 属 IO, 包到 IO dispatcher;
+                // importScript 是 manager 调用, 无需包裹 —— 其内部已自带 dispatcher。
+                val code = withContext(Dispatchers.IO) {
+                    getApplication<Application>().contentResolver
+                        .openInputStream(uri)?.use { it.readBytes().toString(Charsets.UTF_8) }
+                        ?: throw IllegalStateException(
+                            getApplication<Application>().getString(R.string.err_cannot_read_file)
+                        )
+                }
                 _result.value = scriptManager.importScript(code, ScriptSourceType.FILE)
             } catch (e: Exception) {
                 _result.value = ScriptManager.ImportResult.Error(

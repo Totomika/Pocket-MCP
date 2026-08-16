@@ -2,6 +2,8 @@ package io.github.totomika.pocketmcp.mcp
 
 import io.github.totomika.pocketmcp.runtime.RuntimeManager
 import io.github.totomika.pocketmcp.script.RuntimeConfig
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -23,6 +25,10 @@ import kotlinx.coroutines.withContext
  * 重构后: 持久化全走 `files/services/<svcId>/manifest.json`, 不再依赖 Room。
  * "Profile" 系列已全部改名 "Service", 命名与 UI "服务" 统一, 消除歧义。
  *
+ * 线程模型: 所有 suspend 公共方法内部切换到 [ioDispatcher], 调用方无需关心线程。
+ * 启动链路含 acquire → evaluate (脚本可能死循环, create 已有 30s 硬超时),
+ * 停止链路含 destroy 探测 (中毒时最多 2s), 因此绝不能在 Main 上裸跑 —— 本封装保证这一点。
+ *
  * @param manifestStore 服务清单文件存储
  * @param portManager 端口分配
  * @param runtimeManager runtime 引用计数管理
@@ -38,6 +44,7 @@ class ServiceManager(
     private val runtimeConfigLoader: (String) -> RuntimeConfig? = { null },
     private val logManager: io.github.totomika.pocketmcp.data.log.LogManager? = null,
     private var scriptCodes: MutableMap<String, String> = mutableMapOf(),
+    private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) {
     /** 活跃的服务实例: serviceId → McpServiceInstance */
     private val activeServices = mutableMapOf<String, McpServiceInstance>()
@@ -75,8 +82,10 @@ class ServiceManager(
 
     /** 重新加载全部服务快照 (每次 CRUD 后调用)。 */
     suspend fun reload() {
-        val all = manifestStore.listAll()
-        _services.value = all.values.map { it.toEntry() }
+        withContext(ioDispatcher) {
+            val all = manifestStore.listAll()
+            _services.value = all.values.map { it.toEntry() }
+        }
     }
 
     // endregion
@@ -98,33 +107,37 @@ class ServiceManager(
         name: String,
         port: Int,
     ): ServiceEntry {
-        val all = manifestStore.listAll()
-        val usedPorts = all.values.map { it.port }.toSet()
-        portManager.validatePort(port, usedPorts)
+        return withContext(ioDispatcher) {
+            val all = manifestStore.listAll()
+            val usedPorts = all.values.map { it.port }.toSet()
+            portManager.validatePort(port, usedPorts)
 
-        // 重构后无 Room unique index 兜底, 这里显式校验名字唯一性
-        val nameConflict = all.values.any { it.name == name }
-        if (nameConflict) {
-            throw ServiceNameInUseException(name)
+            // 重构后无 Room unique index 兜底, 这里显式校验名字唯一性
+            val nameConflict = all.values.any { it.name == name }
+            if (nameConflict) {
+                throw ServiceNameInUseException(name)
+            }
+
+            val id = manifestStore.newServiceId()
+            val manifest = ServiceManifest(
+                id = id,
+                name = name,
+                port = port,
+                enabled = false,
+            )
+            manifestStore.write(id, manifest)
+            reload()
+            manifest.toEntry()
         }
-
-        val id = manifestStore.newServiceId()
-        val manifest = ServiceManifest(
-            id = id,
-            name = name,
-            port = port,
-            enabled = false,
-        )
-        manifestStore.write(id, manifest)
-        reload()
-        return manifest.toEntry()
     }
 
     /**
      * 获取服务。
      */
     suspend fun getServiceById(id: String): ServiceEntry? {
-        return manifestStore.read(id)?.toEntry()
+        return withContext(ioDispatcher) {
+            manifestStore.read(id)?.toEntry()
+        }
     }
 
     /**
@@ -132,8 +145,10 @@ class ServiceManager(
      * @return 可用端口号; 端口池全部占用时返回 null
      */
     suspend fun findNextPort(): Int? {
-        val usedPorts = manifestStore.listAll().values.map { it.port }.toSet()
-        return portManager.findFreePort(usedPorts)
+        return withContext(ioDispatcher) {
+            val usedPorts = manifestStore.listAll().values.map { it.port }.toSet()
+            portManager.findFreePort(usedPorts)
+        }
     }
 
     /** 默认端口池 (透传 [PortManager.portRange], 供 UI 展示)。 */
@@ -142,8 +157,9 @@ class ServiceManager(
     /**
      * 获取所有服务。
      */
-    suspend fun getAllServices(): List<ServiceEntry> =
+    suspend fun getAllServices(): List<ServiceEntry> = withContext(ioDispatcher) {
         manifestStore.listAll().values.map { it.toEntry() }
+    }
 
     /**
      * 删除服务。
@@ -151,10 +167,12 @@ class ServiceManager(
      * 先停止服务 (如果运行中), 再删除 manifest 文件。
      * 关联 scripts 数组随 manifest 一起删除, 无需单独清理。
      */
-    suspend fun deleteService(id: String) = mutex.withLock {
-        stopServiceInternal(id)
-        manifestStore.delete(id)
-        reload()
+    suspend fun deleteService(id: String) = withContext(ioDispatcher) {
+        mutex.withLock {
+            stopServiceInternal(id)
+            manifestStore.delete(id)
+            reload()
+        }
     }
 
     /**
@@ -166,21 +184,23 @@ class ServiceManager(
      * @throws PortInUseException 端口被其它服务占用或被系统占用
      */
     suspend fun updateService(service: ServiceEntry) {
-        val all = manifestStore.listAll()
-        // 名字唯一性: 排除自身
-        val nameConflict = all.values.any { it.id != service.id && it.name == service.name }
-        if (nameConflict) {
-            throw ServiceNameInUseException(service.name)
+        withContext(ioDispatcher) {
+            val all = manifestStore.listAll()
+            // 名字唯一性: 排除自身
+            val nameConflict = all.values.any { it.id != service.id && it.name == service.name }
+            if (nameConflict) {
+                throw ServiceNameInUseException(service.name)
+            }
+            // 端口唯一性: 排除自身
+            val portConflict = all.values.any { it.id != service.id && it.port == service.port }
+            if (portConflict) {
+                throw PortInUseException("Port ${service.port} already assigned to another service")
+            }
+            manifestStore.update(service.id) {
+                it.copy(name = service.name, port = service.port, enabled = service.enabled)
+            }
+            reload()
         }
-        // 端口唯一性: 排除自身
-        val portConflict = all.values.any { it.id != service.id && it.port == service.port }
-        if (portConflict) {
-            throw PortInUseException("Port ${service.port} already assigned to another service")
-        }
-        manifestStore.update(service.id) {
-            it.copy(name = service.name, port = service.port, enabled = service.enabled)
-        }
-        reload()
     }
 
     // endregion
@@ -200,20 +220,22 @@ class ServiceManager(
         namespace: String,
         scriptCode: String,
         enabled: Boolean = true,
-    ) = mutex.withLock {
-        scriptCodes[namespace] = scriptCode
-        manifestStore.update(serviceId) { m ->
-            val refs = m.scripts.toMutableList()
-            refs.removeAll { it.namespace == namespace }
-            refs.add(ServiceManifest.ScriptRef(namespace, enabled))
-            m.copy(scripts = refs)
-        }
+    ) = withContext(ioDispatcher) {
+        mutex.withLock {
+            scriptCodes[namespace] = scriptCode
+            manifestStore.update(serviceId) { m ->
+                val refs = m.scripts.toMutableList()
+                refs.removeAll { it.namespace == namespace }
+                refs.add(ServiceManifest.ScriptRef(namespace, enabled))
+                m.copy(scripts = refs)
+            }
 
-        // 如果服务正在运行, 重新注册工具并通知
-        val svcInstance = activeServices[serviceId]
-        if (svcInstance != null && enabled) {
-            rebuildTools(svcInstance, serviceId)
-            svcInstance.notifyToolsListChanged()
+            // 如果服务正在运行, 重新注册工具并通知
+            val svcInstance = activeServices[serviceId]
+            if (svcInstance != null && enabled) {
+                rebuildTools(svcInstance, serviceId)
+                svcInstance.notifyToolsListChanged()
+            }
         }
     }
 
@@ -223,15 +245,17 @@ class ServiceManager(
     suspend fun removeScriptFromService(
         serviceId: String,
         namespace: String,
-    ) = mutex.withLock {
-        manifestStore.update(serviceId) { m ->
-            m.copy(scripts = m.scripts.filterNot { it.namespace == namespace })
-        }
+    ) = withContext(ioDispatcher) {
+        mutex.withLock {
+            manifestStore.update(serviceId) { m ->
+                m.copy(scripts = m.scripts.filterNot { it.namespace == namespace })
+            }
 
-        val svcInstance = activeServices[serviceId]
-        if (svcInstance != null) {
-            rebuildTools(svcInstance, serviceId)
-            svcInstance.notifyToolsListChanged()
+            val svcInstance = activeServices[serviceId]
+            if (svcInstance != null) {
+                rebuildTools(svcInstance, serviceId)
+                svcInstance.notifyToolsListChanged()
+            }
         }
     }
 
@@ -242,17 +266,19 @@ class ServiceManager(
         serviceId: String,
         namespace: String,
         enabled: Boolean,
-    ) = mutex.withLock {
-        manifestStore.update(serviceId) { m ->
-            m.copy(scripts = m.scripts.map {
-                if (it.namespace == namespace) it.copy(enabled = enabled) else it
-            })
-        }
+    ) = withContext(ioDispatcher) {
+        mutex.withLock {
+            manifestStore.update(serviceId) { m ->
+                m.copy(scripts = m.scripts.map {
+                    if (it.namespace == namespace) it.copy(enabled = enabled) else it
+                })
+            }
 
-        val svcInstance = activeServices[serviceId]
-        if (svcInstance != null) {
-            rebuildTools(svcInstance, serviceId)
-            svcInstance.notifyToolsListChanged()
+            val svcInstance = activeServices[serviceId]
+            if (svcInstance != null) {
+                rebuildTools(svcInstance, serviceId)
+                svcInstance.notifyToolsListChanged()
+            }
         }
     }
 
@@ -260,7 +286,9 @@ class ServiceManager(
      * 获取服务包含的脚本引用列表。
      */
     suspend fun getServiceScripts(serviceId: String): List<ServiceManifest.ScriptRef> {
-        return manifestStore.read(serviceId)?.scripts ?: emptyList()
+        return withContext(ioDispatcher) {
+            manifestStore.read(serviceId)?.scripts ?: emptyList()
+        }
     }
 
     // endregion
@@ -273,8 +301,10 @@ class ServiceManager(
      * @throws PortInUseException 端口被占用
      * @throws com.dokar.quickjs.QuickJsException 脚本 evaluate 失败
      */
-    suspend fun startService(serviceId: String) = mutex.withLock {
-        startServiceInternal(serviceId)
+    suspend fun startService(serviceId: String) = withContext(ioDispatcher) {
+        mutex.withLock {
+            startServiceInternal(serviceId)
+        }
     }
 
     /**
@@ -336,15 +366,17 @@ class ServiceManager(
      * 即使 manifest 文件已被删除 (例如 deleteService 先跑了一半), 也要保证 runtime 引用被释放,
      * 不会因 manifestStore.update 找不到文件而抛异常中断清理。
      */
-    suspend fun stopService(serviceId: String) = mutex.withLock {
-        val manifest = manifestStore.read(serviceId)
-        stopServiceInternal(serviceId)
-        // manifest 可能已被并发删除, update 找不到文件时跳过 enabled=false 写入
-        if (manifest != null) {
-            runCatching { manifestStore.update(serviceId) { it.copy(enabled = false) } }
+    suspend fun stopService(serviceId: String) = withContext(ioDispatcher) {
+        mutex.withLock {
+            val manifest = manifestStore.read(serviceId)
+            stopServiceInternal(serviceId)
+            // manifest 可能已被并发删除, update 找不到文件时跳过 enabled=false 写入
+            if (manifest != null) {
+                runCatching { manifestStore.update(serviceId) { it.copy(enabled = false) } }
+            }
+            reload()
+            logManager?.system("Service '${manifest?.name ?: serviceId}' stopped")
         }
-        reload()
-        logManager?.system("Service '${manifest?.name ?: serviceId}' stopped")
     }
 
     /**
@@ -356,28 +388,30 @@ class ServiceManager(
      * @param namespace 脚本 namespace
      * @return 成功重启的服务数量
      */
-    suspend fun restartServicesForScript(namespace: String): Int = mutex.withLock {
-        val idsToRestart = activeServices.entries
-            .filter { it.value.scriptNamespaces.contains(namespace) }
-            .map { it.key }
+    suspend fun restartServicesForScript(namespace: String): Int = withContext(ioDispatcher) {
+        mutex.withLock {
+            val idsToRestart = activeServices.entries
+                .filter { it.value.scriptNamespaces.contains(namespace) }
+                .map { it.key }
 
-        if (idsToRestart.isEmpty()) return@withLock 0
+            if (idsToRestart.isEmpty()) return@withLock 0
 
-        for (id in idsToRestart) {
-            stopServiceInternal(id)
-        }
-
-        var restarted = 0
-        for (id in idsToRestart) {
-            try {
-                startServiceInternal(id)
-                restarted++
-            } catch (e: Exception) {
-                logManager?.system("Failed to restart service $id after script '$namespace' update: ${e.message}")
+            for (id in idsToRestart) {
+                stopServiceInternal(id)
             }
+
+            var restarted = 0
+            for (id in idsToRestart) {
+                try {
+                    startServiceInternal(id)
+                    restarted++
+                } catch (e: Exception) {
+                    logManager?.system("Failed to restart service $id after script '$namespace' update: ${e.message}")
+                }
+            }
+            logManager?.system("Restarted $restarted service(s) for script '$namespace'")
+            restarted
         }
-        logManager?.system("Restarted $restarted service(s) for script '$namespace'")
-        restarted
     }
 
     /**
@@ -388,15 +422,17 @@ class ServiceManager(
      *
      * @return true 表示成功重启, false 表示服务原本未运行
      */
-    suspend fun restartService(serviceId: String): Boolean = mutex.withLock {
-        if (!activeServices.containsKey(serviceId)) return@withLock false
-        stopServiceInternal(serviceId)
-        try {
-            startServiceInternal(serviceId)
-            true
-        } catch (e: Exception) {
-            logManager?.system("Failed to restart service $serviceId: ${e.message}")
-            false
+    suspend fun restartService(serviceId: String): Boolean = withContext(ioDispatcher) {
+        mutex.withLock {
+            if (!activeServices.containsKey(serviceId)) return@withLock false
+            stopServiceInternal(serviceId)
+            try {
+                startServiceInternal(serviceId)
+                true
+            } catch (e: Exception) {
+                logManager?.system("Failed to restart service $serviceId: ${e.message}")
+                false
+            }
         }
     }
 
@@ -404,30 +440,34 @@ class ServiceManager(
      * 恢复所有 enabled=true 的服务 (前台服务重启时调用)。
      */
     suspend fun restoreEnabledServices(): Int {
-        val enabledManifests = manifestStore.listAll().values.filter { it.enabled }
-        var restored = 0
-        for (m in enabledManifests) {
-            try {
-                startService(m.id)
-                restored++
-            } catch (e: Exception) {
-                e.printStackTrace()
+        return withContext(ioDispatcher) {
+            val enabledManifests = manifestStore.listAll().values.filter { it.enabled }
+            var restored = 0
+            for (m in enabledManifests) {
+                try {
+                    startService(m.id)
+                    restored++
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
             }
+            restored
         }
-        return restored
     }
 
     /**
      * 销毁所有服务 (app 退出时调用)。
      */
-    suspend fun destroyAll() = mutex.withLock {
-        for ((_, svcInstance) in activeServices) {
-            svcInstance.stop()
-            for (ns in svcInstance.scriptNamespaces) {
-                runtimeManager.release(ns)
+    suspend fun destroyAll() = withContext(ioDispatcher) {
+        mutex.withLock {
+            for ((_, svcInstance) in activeServices) {
+                svcInstance.stop()
+                for (ns in svcInstance.scriptNamespaces) {
+                    runtimeManager.release(ns)
+                }
             }
+            activeServices.clear()
         }
-        activeServices.clear()
     }
 
     /** 获取活跃服务数量。 */
