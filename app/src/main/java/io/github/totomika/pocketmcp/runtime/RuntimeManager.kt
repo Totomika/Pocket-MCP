@@ -117,9 +117,9 @@ class RuntimeManager(
     /** 销毁所有 runtime。 */
     suspend fun destroyAll() = withContext(ioDispatcher) {
         mutex.withLock {
-            // destroy 是 suspend, 不能放 forEach 内
             for (entry in runtimes.values) {
-                entry.destroy()
+                // 单个 runtime 销毁失败 (如 onDestroy 清理异常) 不应中断其余 (退出路径, 尽力而为)
+                runCatching { entry.destroy() }
             }
             runtimes.clear()
         }

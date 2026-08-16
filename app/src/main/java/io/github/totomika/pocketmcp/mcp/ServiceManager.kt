@@ -448,7 +448,7 @@ class ServiceManager(
                     startService(m.id)
                     restored++
                 } catch (e: Exception) {
-                    e.printStackTrace()
+                    logManager?.system("Failed to restore service '${m.name}': ${e.message}")
                 }
             }
             restored
@@ -461,9 +461,12 @@ class ServiceManager(
     suspend fun destroyAll() = withContext(ioDispatcher) {
         mutex.withLock {
             for ((_, svcInstance) in activeServices) {
-                svcInstance.stop()
+                // 单个服务的清理失败不应中断其余服务 (app 退出路径, 尽力而为)
+                runCatching { svcInstance.stop() }
+                    .onFailure { logManager?.system("Failed to stop service '${svcInstance.service.name}': ${it.message}") }
                 for (ns in svcInstance.scriptNamespaces) {
-                    runtimeManager.release(ns)
+                    runCatching { runtimeManager.release(ns) }
+                        .onFailure { logManager?.system("Failed to release runtime '$ns': ${it.message}") }
                 }
             }
             activeServices.clear()
@@ -488,9 +491,13 @@ class ServiceManager(
         try {
             svcInstance.stop()
         } finally {
-            // 无论 Ktor stop 是否异常, 都必须释放 runtime 引用, 否则重启会复用已损坏的 runtime
-            for (ns in svcInstance.scriptNamespaces) {
-                runtimeManager.release(ns)
+            // 无论 Ktor stop 是否异常、调用方协程是否被取消, 都必须完成 runtime 引用释放
+            // (NonCancellable: 中途被取消会让 release 在第一个挂起点抛 CancellationException,
+            // 引用计数泄漏, 重启时误复用/误销毁 runtime —— 与 startServiceInternal 失败路径同纪律)
+            withContext(NonCancellable) {
+                for (ns in svcInstance.scriptNamespaces) {
+                    runtimeManager.release(ns)
+                }
             }
         }
     }
@@ -511,28 +518,43 @@ class ServiceManager(
             svcInstance.registeredTools.remove(toolName)
         }
 
-        // 重新注册启用的脚本工具
+        // 重新注册启用的脚本工具; 记录本次新增 acquire 的 namespace,
+        // 中途失败时在 NonCancellable 中补偿释放 (与 startServiceInternal 的失败路径纪律一致,
+        // 否则一次脚本语法错误就永久泄漏 refCount: 引用计数高于真实值, runtime 永不销毁)
         val newNamespaces = mutableSetOf<String>()
-        for (ref in refs) {
-            if (!ref.enabled) continue
-            ensureCodeLoaded(ref.namespace)
-            val code = scriptCodes[ref.namespace] ?: continue
+        try {
+            for (ref in refs) {
+                if (!ref.enabled) continue
+                ensureCodeLoaded(ref.namespace)
+                val code = scriptCodes[ref.namespace] ?: continue
 
-            // 确保 runtime 存在
-            runtimeManager.acquire(ref.namespace, code, runtimeConfigLoader(ref.namespace))
-            newNamespaces.add(ref.namespace)
+                runtimeManager.acquire(ref.namespace, code, runtimeConfigLoader(ref.namespace))
+                newNamespaces.add(ref.namespace)
 
-            val runtime = runtimeManager.getRuntime(ref.namespace)
-            if (runtime != null) {
-                for ((localName, toolDef) in runtime.toolRegistry) {
-                    val fullName = "${ref.namespace}_$localName"
-                    serverFactory.registerTool(
-                        svcInstance.mcpServer, fullName, toolDef,
-                        ref.namespace, localName,
-                    )
-                    svcInstance.registeredTools.add(fullName)
+                val runtime = runtimeManager.getRuntime(ref.namespace)
+                if (runtime != null) {
+                    for ((localName, toolDef) in runtime.toolRegistry) {
+                        val fullName = "${ref.namespace}_$localName"
+                        serverFactory.registerTool(
+                            svcInstance.mcpServer, fullName, toolDef,
+                            ref.namespace, localName,
+                        )
+                        svcInstance.registeredTools.add(fullName)
+                    }
                 }
             }
+        } catch (e: Exception) {
+            // 补偿: 释放本次新增的引用。原有引用 (removed 集合里还没被 release 的) 不动 ——
+            // 它们是变更前就在的, 由下方的正常路径或服务停止时释放。
+            // 注意语义: 若失败发生在下面 release removed 之前, 旧引用这一次不会释放, 这是可接受的 ——
+            // manifest 已更新, 下次成功的 rebuild 或服务停止时会走到 release; 引用计数暂时偏高
+            // 比错误释放安全 (错误释放会导致还在用该 runtime 的其它服务踩空)。
+            withContext(NonCancellable) {
+                for (ns in newNamespaces) {
+                    runCatching { runtimeManager.release(ns) }
+                }
+            }
+            throw e
         }
 
         // 释放不再引用的 runtime
