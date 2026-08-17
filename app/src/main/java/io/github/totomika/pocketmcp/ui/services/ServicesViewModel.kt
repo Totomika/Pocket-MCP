@@ -30,7 +30,6 @@ data class ServiceSummary(
 class ServicesViewModel(app: Application) : AndroidViewModel(app) {
     private val application = app
     private val serviceManager = app.container.serviceManager
-    private val scriptRepository = app.container.scriptRepository
     private val scriptManager = app.container.scriptManager
 
     private val _services = MutableStateFlow<List<ServiceEntry>>(emptyList())
@@ -163,7 +162,7 @@ class ServicesViewModel(app: Application) : AndroidViewModel(app) {
                 // manager 内部已切换到 IO dispatcher, Main 调用安全
                 val service = serviceManager.createService(name, actualPort)
                 for (namespace in selectedNamespaces) {
-                    val code = scriptRepository.readScriptCode(namespace) ?: continue
+                    val code = scriptManager.readScriptCode(namespace) ?: continue
                     serviceManager.addScriptToService(service.id, namespace, code, enabled = true)
                 }
                 reload()

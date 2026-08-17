@@ -507,6 +507,13 @@ class ServiceManager(
      *
      * 旧工具全部 removeTool, 新工具重新 addTool。
      * 用于脚本增删/勾选变化时。
+     *
+     * 引用纪律 (增量 acquire): 对本服务已持有的 namespace **不重复 acquire**, 只对
+     * 新增的 acquire —— 否则每次 rebuild 都给保留者的 refCount +1 且无对应 release,
+     * 计数随 rebuild 次数无界上浮, runtime 永不销毁 (每脚本每服务泄漏 1 线程 + native ctx)。
+     * 引用只在两种情况发生变化: 新增 namespace → acquire; 移除 namespace → release。
+     * 已持有的毒化 runtime 不在此路径重建 (tools registry 仍有效, 调用由 ToolBridge 拒绝),
+     * 恢复依赖服务 stop/start (refCount 归零 → 全新 create)。
      */
     private suspend fun rebuildTools(svcInstance: McpServiceInstance, serviceId: String) {
         val manifest = manifestStore.read(serviceId) ?: return
@@ -518,18 +525,25 @@ class ServiceManager(
             svcInstance.registeredTools.remove(toolName)
         }
 
-        // 重新注册启用的脚本工具; 记录本次新增 acquire 的 namespace,
-        // 中途失败时在 NonCancellable 中补偿释放 (与 startServiceInternal 的失败路径纪律一致,
-        // 否则一次脚本语法错误就永久泄漏 refCount: 引用计数高于真实值, runtime 永不销毁)
+        // retained: 变更前已持有的引用 (增量 acquire 的跳过集)
+        // newNamespaces: 重建后应持有的全集 (含 retained)
+        // acquired: 本次真正新 acquire 的 (失败补偿只释放这部分)
+        val retained = svcInstance.scriptNamespaces.toSet()
         val newNamespaces = mutableSetOf<String>()
+        val acquired = mutableSetOf<String>()
         try {
             for (ref in refs) {
                 if (!ref.enabled) continue
                 ensureCodeLoaded(ref.namespace)
                 val code = scriptCodes[ref.namespace] ?: continue
 
-                runtimeManager.acquire(ref.namespace, code, runtimeConfigLoader(ref.namespace))
                 newNamespaces.add(ref.namespace)
+                if (ref.namespace in retained) {
+                    // 已持有引用: 不重复 acquire (防 refCount 漂移), 仅重新注册工具
+                } else {
+                    runtimeManager.acquire(ref.namespace, code, runtimeConfigLoader(ref.namespace))
+                    acquired.add(ref.namespace)
+                }
 
                 val runtime = runtimeManager.getRuntime(ref.namespace)
                 if (runtime != null) {
@@ -544,13 +558,13 @@ class ServiceManager(
                 }
             }
         } catch (e: Exception) {
-            // 补偿: 释放本次新增的引用。原有引用 (removed 集合里还没被 release 的) 不动 ——
+            // 补偿: 只释放本次新增的引用 (acquired)。原有引用不动 ——
             // 它们是变更前就在的, 由下方的正常路径或服务停止时释放。
-            // 注意语义: 若失败发生在下面 release removed 之前, 旧引用这一次不会释放, 这是可接受的 ——
+            // 若失败发生在 release removed 之前, 被移除者的旧引用这一次不会释放, 这是可接受的 ——
             // manifest 已更新, 下次成功的 rebuild 或服务停止时会走到 release; 引用计数暂时偏高
             // 比错误释放安全 (错误释放会导致还在用该 runtime 的其它服务踩空)。
             withContext(NonCancellable) {
-                for (ns in newNamespaces) {
+                for (ns in acquired) {
                     runCatching { runtimeManager.release(ns) }
                 }
             }

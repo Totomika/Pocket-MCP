@@ -62,8 +62,24 @@ class ToolBridge(
         // 注意: 这里不串行化 JS —— 真正的"一次一个"由后面的单线程 dispatcher + runJs 派发的
         // evaluate 保证 (evaluate 的 jsResultMutex 在 awaitAsyncJobs 期间也持有, 故等异步 I/O 时
         // 别的工具调用的 evaluate 进不来)。
+        //
+        // 入队 (send) 故意放在 withTimeout 之外: 队列满 = 已有 8 个在飞调用, 属正常背压;
+        // 若纳入超时, 排队超时会走探针路径, 而探针撞上正在执行的长调用会把"健康但繁忙"
+        // 误判成 STUCK_DISPATCHER 中毒。排队等待本身无风险 (取消即返回)。
+        //
+        // 令牌纪律: 只在真正入队后才出队 —— 满队列时被取消的 send 未入队, 若在 finally
+        // 盲目 receive 会偷走其它在飞调用的令牌, 令牌失衡后最后一个完成者将永久挂起。
+        var slotAcquired = false
         return try {
             runtime.callQueue.send(Unit) // 入队 (容量 8, 满则挂起)
+            slotAcquired = true
+            // 拿到槽位后复查毒化: 排队期间 runtime 可能已中毒, 不再空等一轮超时
+            if (runtime.poisoned) {
+                logManager?.mcp(namespace, "Tool call rejected (runtime poisoned while queued): $toolName")
+                return errorResult(
+                    "Runtime is unresponsive (previous call timed out). Restart the service to recover."
+                )
+            }
             try {
                 withTimeout(timeoutMs) {
                     val argsJson = args.toString()
@@ -114,7 +130,8 @@ class ToolBridge(
                 errorResult(e.message ?: "Unknown error")
             }
         } finally {
-            runtime.callQueue.receive() // 出队
+            // 仅当真正入队才出队 (见上方"令牌纪律"注释)
+            if (slotAcquired) runtime.callQueue.receive()
         }
     }
 

@@ -8,6 +8,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * host.sql API 实现。
@@ -30,9 +31,23 @@ import java.io.File
  */
 class SqlApi(private val pathManager: FsPathManager) : HostApi {
 
+    // namespace → (dbName → 打开的连接)。实例字段而非 inject 局部变量:
+    // runtime 销毁时 cleanup(namespace) 需要能找到并关闭该脚本打开的全部连接,
+    // 否则句柄只能等 GC finalizer 兜底 (与 KvApi 的 databases 纪律一致)。
+    private val connections = ConcurrentHashMap<String, MutableMap<String, android.database.sqlite.SQLiteDatabase>>()
+
+    private fun connectionsFor(namespace: String): MutableMap<String, android.database.sqlite.SQLiteDatabase> =
+        connections.getOrPut(namespace) { ConcurrentHashMap() }
+
+    override fun cleanup(namespace: String) {
+        connections.remove(namespace)?.values?.forEach { db ->
+            runCatching { db.close() }
+        }
+    }
+
     override suspend fun inject(entry: RuntimeEntry, namespace: String) {
         val sqlDir = pathManager.sqlDir(namespace).apply { mkdirs() }
-        val connections = mutableMapOf<String, android.database.sqlite.SQLiteDatabase>()
+        val connections = connectionsFor(namespace)
 
         // open(dbName) → 返回 db handle (字符串 id)
         entry.quickJs.asyncFunction<String>("__sql_open") { args ->

@@ -114,8 +114,16 @@ class RuntimeFactory(
                 entry?.scope?.cancel()
                 // safeCloseQuickJs 防 evaluate 半卡死场景: 若脚本顶层死循环导致 evaluate
                 // 被取消, jsMutex 仍被 dispatcher 线程持有, 直接 close() 会自旋卡死
-                safeCloseQuickJs(quickJs, dispatcher)
-                dispatcher.close()
+                val closed = safeCloseQuickJs(quickJs, dispatcher)
+                if (closed) {
+                    // 仅当 close 成功 (线程空闲) 才关闭线程池; 孤儿化时线程仍被死循环占用
+                    // (与 RuntimeEntry.destroy 的决策纪律一致)
+                    dispatcher.close()
+                } else {
+                    // 孤儿化记账: create 失败路径的泄漏与 destroy 路径同价 (1 线程 + 1 native ctx),
+                    // 必须同入 OrphanLedger, 否则账本口径不完整、泄漏不可观测
+                    OrphanLedger.onOrphaned(namespace, "create failure (evaluate stuck)")
+                }
             }
             throw ex
         }

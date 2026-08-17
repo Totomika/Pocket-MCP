@@ -38,7 +38,6 @@ data class ScriptDetail(
 class ServiceDetailViewModel(app: Application) : AndroidViewModel(app) {
     private val application = app
     private val serviceManager = app.container.serviceManager
-    private val scriptRepository = app.container.scriptRepository
     private val scriptManager = app.container.scriptManager
 
     private val _service = MutableStateFlow<ServiceEntry?>(null)
@@ -183,7 +182,7 @@ class ServiceDetailViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             try {
                 for (namespace in namespaces) {
-                    val code = scriptRepository.readScriptCode(namespace) ?: continue
+                    val code = scriptManager.readScriptCode(namespace) ?: continue
                     serviceManager.addScriptToService(serviceId, namespace, code, enabled = true)
                 }
             } catch (e: Exception) {

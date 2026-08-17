@@ -21,6 +21,11 @@ import java.util.concurrent.RejectedExecutionException
  * 1 脚本 = 1 QuickJS runtime, 引用计数管理生命周期。
  * 多个 Profile 可以引用同一 runtime, 但只存在一份。
  *
+ * 有意不用 data class: 可变状态 (refCount / onDestroy / 毒化) 声明在类体,
+ * data class 的 copy() 只复制构造参数 —— 任何一次 copy 都会静默重置这些状态
+ * (幽灵引用/丢失清理回调/丢失毒化标记); equals 语义也容易误导。
+ * 全项目按引用身份使用本类, 无 equals/copy 需求。
+ *
  * @property namespace 脚本唯一标识
  * @property quickJs QuickJS 实例
  * @property dispatcher runtime 专属单线程 dispatcher。它本身并不串行化任何 JS 调用
@@ -31,7 +36,7 @@ import java.util.concurrent.RejectedExecutionException
  * @property callQueue 并发上限队列 (FIFO, 深度 8), 限制同时 in-flight 的 tools/call
  * @property healthChecker 健康检查 Job
  */
-data class RuntimeEntry(
+class RuntimeEntry(
     val namespace: String,
     val quickJs: QuickJs,
     val dispatcher: CoroutineDispatcher,

@@ -104,8 +104,10 @@ suspend fun <T> runJs(block: suspend QuickJs.() -> T): T =
 离开调用方上下文执行。这取代了原先散落在各 ViewModel 的
 `withContext(Dispatchers.Default)` 补丁; **ViewModel 无需也不应再包线程**。
 
-注意区分: `RuntimeManager.getRuntime` 是非 suspend 的普通函数, 直接查 map,
-不切线程 (只用于已存在的 runtime 只读查找, 如 ToolBridge)。
+注意区分: `RuntimeManager.getRuntime` 是非 suspend 的普通函数, 直接查
+`ConcurrentHashMap` (读侧线程安全: Ktor 请求线程高频无锁读与 mutex 内的结构性
+写入并发, 故用 CHM 而非 HashMap; 写侧仍由 mutex 串行化), 只用于已存在 runtime
+的只读查找, 如 ToolBridge。
 
 ### 2.4 native 访问亲和
 
@@ -282,7 +284,10 @@ destroy()
 
 1. `destroy()` 且 `poisonReason == STUCK_DISPATCHER` (已确认卡死, 直接记账);
 2. `destroy()` 且非 STUCK 原因但 `safeCloseQuickJs` 探针超时
-   (dispatcher 忙, 判定 close 会自旋)。
+   (dispatcher 忙, 判定 close 会自旋);
+3. `RuntimeFactory.create` 失败路径且 `safeCloseQuickJs` 探针超时
+   (典型: 脚本顶层死循环触发 30s 硬超时后被取消, 线程仍被 native 死循环占用) ——
+   与 destroy 路径同价 (1 线程 + 1 native ctx), 同入账本。
 
 不会触发:
 
@@ -380,19 +385,26 @@ tools/call 转发到 JS handler。运行实例封装为 `McpServiceInstance`
 - `restoreEnabledServices`: 前台服务重启时恢复所有 `enabled=true` 的服务。
 - `destroyAll`: 逐个 `runCatching { stop + release }` + 清空 (退出路径尽力而为)。
 
-### rebuildTools 的补偿语义
+### rebuildTools 的补偿语义 (增量 acquire)
 
-脚本增删/勾选变化时 `rebuildTools`: 先 removeTool 全部旧工具, 再为 enabled
-refs 逐个 `acquire` + 注册, 期间以 `newNamespaces` 记录**本次新增**的
-acquire。
+脚本增删/勾选变化时 `rebuildTools`: 先 removeTool 全部旧工具, 再遍历 enabled
+refs。**对本服务已持有的 namespace (retained) 不重复 acquire, 只重新注册工具**;
+仅对新增 namespace `acquire` (记入 `acquired` 集合)。
 
-- 中途失败: `NonCancellable` 只释放 `newNamespaces` (runCatching 逐个),
-  旧引用 (变更前已在、尚未由正常路径释放的) **不动** —— 若失败发生在 release
-  removed 之前, 旧引用这一次不会释放, 引用计数**暂时偏高**;
-  "偏高比错误释放安全": 错误释放会让仍在用该 runtime 的其它服务踩空 (其入队
-  排队、调用将悬挂)。下次成功 rebuild 或服务停止时会走到 release。
+> 为什么增量: 若每次 rebuild 对全部 enabled refs 重新 acquire, 保留者的 refCount
+> 会随 rebuild 次数无界上浮且无对应 release —— 运行中服务每 toggle/add/remove 一次
+> 就 +1, runtime 永不销毁 (每脚本每服务泄漏 1 线程 + native ctx)。引用只在两种
+> 情况变化: 新增 namespace → acquire; 移除 namespace → release。
+> 已持有的毒化 runtime 不经此路径重建 (其 toolRegistry 仍有效, 调用被 ToolBridge
+> 拒绝); 恢复依赖服务 stop/start (refCount 归零 → 全新 create)。
+
+- 中途失败: `NonCancellable` 只释放 `acquired` (runCatching 逐个), 原有引用
+  **不动** —— 若失败发生在 release removed 之前, 被移除者的旧引用这一次不会
+  释放, 引用计数**暂时偏高**; "偏高比错误释放安全": 错误释放会让仍在用该
+  runtime 的其它服务踩空 (其入队排队、调用将悬挂)。下次成功 rebuild 或服务
+  停止时会走到 release。
 - 成功完成后: `removed = scriptNamespaces - newNamespaces` 逐个 release,
-  再更新 `scriptNamespaces` —— 引用只随 manifest 收敛。
+  再更新 `scriptNamespaces` —— 引用计数与 manifest 严格一致。
 
 ### 双 mutex 结构 (嵌套顺序)
 

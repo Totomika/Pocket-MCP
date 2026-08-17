@@ -6,6 +6,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * 管理所有脚本运行时的生命周期。
@@ -26,7 +28,10 @@ class RuntimeManager(
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
 ) {
 
-    private val runtimes = mutableMapOf<String, RuntimeEntry>()
+    // ConcurrentHashMap: getRuntime/activeCount 被 Ktor 请求线程高频无锁读,
+    // 与 acquire/release (mutex 内) 的结构性写入并发 —— HashMap 在此存在数据竞态
+    // (丢条目/脏读)。写侧仍由 mutex 串行化, CHM 只保证读侧安全。
+    private val runtimes = ConcurrentHashMap<String, RuntimeEntry>()
     private val mutex = Mutex()
 
     /**
@@ -97,20 +102,26 @@ class RuntimeManager(
     /**
      * 动态更新运行时的 memoryLimit / maxStackSize。
      *
-     * 若 runtime 正在运行, 经 [RuntimeEntry.runJs] 在 runtime 专属线程上热更新
-     * (native setter 与 JS 执行同线程, 避免并发访问 native ctx);
-     * 若未运行, 下次 [acquire] 创建时从 manifest 读取生效。
+     * best-effort: 若 runtime 正在运行, 经 [RuntimeEntry.runJs] 在 runtime 专属线程上热更新
+     * (native setter 与 JS 执行同线程, 避免并发访问 native ctx); 已中毒/已关闭/派发失败
+     * (如与销毁竞争) 时静默跳过 —— manifest 已持久化, 下次 acquire 自然生效。
+     * 不设无界挂起: 探针级超时兜底 (对 STUCK 的 runtime 调 runJs 会永久挂起)。
      */
     suspend fun updateRuntimeConfig(namespace: String, config: RuntimeConfig) {
         val entry = runtimes[namespace] ?: return
+        if (entry.poisoned || entry.quickJs.isClosed) return
         // 0 = 无限制, 需转为极大值 (QuickJS 的 0 = "0 字节可用")
         val memLimit = config.memoryLimit?.let { if (it == 0L) RuntimeFactory.UNLIMITED else it }
             ?: RuntimeFactory.DEFAULT_MEMORY_LIMIT
         val stackSize = config.maxStackSize?.let { if (it == 0L) RuntimeFactory.UNLIMITED else it }
             ?: RuntimeFactory.DEFAULT_MAX_STACK_SIZE
-        entry.runJs {
-            memoryLimit = memLimit
-            maxStackSize = stackSize
+        runCatching {
+            withTimeoutOrNull(RuntimePolicy.PROBE_TIMEOUT_MS) {
+                entry.runJs {
+                    memoryLimit = memLimit
+                    maxStackSize = stackSize
+                }
+            }
         }
     }
 

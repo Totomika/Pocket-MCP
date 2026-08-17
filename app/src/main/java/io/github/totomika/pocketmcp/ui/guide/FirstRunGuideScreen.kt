@@ -1,4 +1,4 @@
-﻿package io.github.totomika.pocketmcp.ui.guide
+package io.github.totomika.pocketmcp.ui.guide
 
 import android.Manifest
 import android.app.Application
@@ -96,7 +96,6 @@ sealed class InstallState {
 class GuideViewModel(private val app: Application) : AndroidViewModel(app) {
     private val scriptManager by lazy { app.container.scriptManager }
     private val serviceManager by lazy { app.container.serviceManager }
-    private val scriptRepository by lazy { app.container.scriptRepository }
     private val prefs = app.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     val isCompleted: Boolean get() = prefs.getBoolean(KEY_COMPLETED, false)
@@ -174,7 +173,7 @@ class GuideViewModel(private val app: Application) : AndroidViewModel(app) {
         try {
             val service = serviceManager.createService("默认服务", port)
             for (ns in namespaces) {
-                val code = scriptRepository.readScriptCode(ns) ?: continue
+                val code = scriptManager.readScriptCode(ns) ?: continue
                 serviceManager.addScriptToService(service.id, ns, code, enabled = true)
             }
         } catch (e: ServiceNameInUseException) {
@@ -182,7 +181,7 @@ class GuideViewModel(private val app: Application) : AndroidViewModel(app) {
             val existing = serviceManager.getAllServices().firstOrNull { it.name == "默认服务" }
             if (existing != null) {
                 for (ns in namespaces) {
-                    val code = scriptRepository.readScriptCode(ns) ?: continue
+                    val code = scriptManager.readScriptCode(ns) ?: continue
                     serviceManager.addScriptToService(existing.id, ns, code, enabled = true)
                 }
             }
