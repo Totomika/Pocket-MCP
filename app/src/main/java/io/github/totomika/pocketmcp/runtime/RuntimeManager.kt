@@ -13,11 +13,11 @@ import kotlinx.coroutines.withContext
  * 核心原则: 1 脚本 = 1 Runtime。
  * 多个 Profile 引用同一脚本时, 共享同一 runtime, 引用计数管理。
  *
- * - refCount 0→1: 创建 runtime, evaluate 脚本, 启动 pump + health check
+ * - refCount 0→1: 创建 runtime, evaluate 脚本, 启动 health check
  * - refCount >1: 无操作 (runtime 已存在)
- * - refCount →0: 销毁 runtime, 停止 pump + health check, 释放 native 内存
+ * - refCount →0: 销毁 runtime, 停止 health check, 释放 native 内存
  *
- * 线程模型: 所有 suspend 公共方法内部切换到 [ioDispatcher] (limited IO): 调用方无论
+ * 线程模型: 所有 suspend 公共方法内部切换到 [ioDispatcher] (默认 Dispatchers.IO): 调用方无论
  * 在什么线程 (含 Main), manager 操作必然离开调用方上下文执行。这取代了原先散落在
  * 各 ViewModel 的 withContext(Dispatchers.Default) 补丁。
  */
