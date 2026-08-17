@@ -1,4 +1,4 @@
-﻿package io.github.totomika.pocketmcp.ui.services
+package io.github.totomika.pocketmcp.ui.services
 
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
@@ -38,7 +38,6 @@ data class ScriptDetail(
 class ServiceDetailViewModel(app: Application) : AndroidViewModel(app) {
     private val application = app
     private val serviceManager = app.container.serviceManager
-    private val scriptRepository = app.container.scriptRepository
     private val scriptManager = app.container.scriptManager
 
     private val _service = MutableStateFlow<ServiceEntry?>(null)
@@ -87,7 +86,15 @@ class ServiceDetailViewModel(app: Application) : AndroidViewModel(app) {
 
     fun toggleScript(serviceId: String, namespace: String, enabled: Boolean) {
         viewModelScope.launch {
-            serviceManager.toggleScriptEnabled(serviceId, namespace, enabled)
+            try {
+                serviceManager.toggleScriptEnabled(serviceId, namespace, enabled)
+            } catch (e: Exception) {
+                _message.value = application.getString(
+                    R.string.toggle_script_failed,
+                    e.message ?: application.getString(R.string.error_unknown)
+                )
+            }
+            // manifest 已变更 (无论 rebuildTools 是否成功), 刷新反映真实状态
             refreshScriptDetails(serviceId)
         }
     }
@@ -118,7 +125,14 @@ class ServiceDetailViewModel(app: Application) : AndroidViewModel(app) {
 
     fun deleteService(serviceId: String, onDone: () -> Unit) {
         viewModelScope.launch {
-            serviceManager.deleteService(serviceId)
+            try {
+                serviceManager.deleteService(serviceId)
+            } catch (e: Exception) {
+                _message.value = application.getString(
+                    R.string.delete_service_failed,
+                    e.message ?: application.getString(R.string.error_unknown)
+                )
+            }
             onDone()
         }
     }
@@ -166,10 +180,18 @@ class ServiceDetailViewModel(app: Application) : AndroidViewModel(app) {
     /** 批量添加脚本到服务。 */
     fun addScripts(serviceId: String, namespaces: List<String>) {
         viewModelScope.launch {
-            for (namespace in namespaces) {
-                val code = scriptRepository.readScriptCode(namespace) ?: continue
-                serviceManager.addScriptToService(serviceId, namespace, code, enabled = true)
+            try {
+                for (namespace in namespaces) {
+                    val code = scriptManager.readScriptCode(namespace) ?: continue
+                    serviceManager.addScriptToService(serviceId, namespace, code, enabled = true)
+                }
+            } catch (e: Exception) {
+                _message.value = application.getString(
+                    R.string.add_scripts_failed,
+                    e.message ?: application.getString(R.string.error_unknown)
+                )
             }
+            // manifest 已变更 (无论 rebuildTools 是否成功), 刷新反映真实状态
             refreshScriptDetails(serviceId)
         }
     }
@@ -177,7 +199,15 @@ class ServiceDetailViewModel(app: Application) : AndroidViewModel(app) {
     /** 从服务移除脚本。 */
     fun removeScript(serviceId: String, namespace: String) {
         viewModelScope.launch {
-            serviceManager.removeScriptFromService(serviceId, namespace)
+            try {
+                serviceManager.removeScriptFromService(serviceId, namespace)
+            } catch (e: Exception) {
+                _message.value = application.getString(
+                    R.string.remove_script_failed,
+                    e.message ?: application.getString(R.string.error_unknown)
+                )
+            }
+            // manifest 已变更 (无论 rebuildTools 是否成功), 刷新反映真实状态
             refreshScriptDetails(serviceId)
         }
     }

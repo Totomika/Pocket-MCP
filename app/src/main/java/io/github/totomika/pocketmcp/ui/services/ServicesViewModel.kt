@@ -1,4 +1,4 @@
-﻿package io.github.totomika.pocketmcp.ui.services
+package io.github.totomika.pocketmcp.ui.services
 
 import android.app.Application
 import android.util.Log
@@ -30,7 +30,6 @@ data class ServiceSummary(
 class ServicesViewModel(app: Application) : AndroidViewModel(app) {
     private val application = app
     private val serviceManager = app.container.serviceManager
-    private val scriptRepository = app.container.scriptRepository
     private val scriptManager = app.container.scriptManager
 
     private val _services = MutableStateFlow<List<ServiceEntry>>(emptyList())
@@ -125,6 +124,7 @@ class ServicesViewModel(app: Application) : AndroidViewModel(app) {
     fun startService(id: String) {
         viewModelScope.launch {
             try {
+                // manager 内部已切换到 IO dispatcher, Main 调用安全
                 serviceManager.startService(id)
                 _runningIds.value = _runningIds.value + id
             } catch (e: Exception) {
@@ -136,6 +136,7 @@ class ServicesViewModel(app: Application) : AndroidViewModel(app) {
     fun stopService(id: String) {
         viewModelScope.launch {
             try {
+                // manager 内部已切换到 IO dispatcher, Main 调用安全
                 serviceManager.stopService(id)
                 _runningIds.value = _runningIds.value - id
             } catch (e: Exception) {
@@ -158,9 +159,10 @@ class ServicesViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 val actualPort = port ?: _previewPort.value
                 ?: throw IllegalStateException(application.getString(R.string.no_port_available, portRangeHint))
+                // manager 内部已切换到 IO dispatcher, Main 调用安全
                 val service = serviceManager.createService(name, actualPort)
                 for (namespace in selectedNamespaces) {
-                    val code = scriptRepository.readScriptCode(namespace) ?: continue
+                    val code = scriptManager.readScriptCode(namespace) ?: continue
                     serviceManager.addScriptToService(service.id, namespace, code, enabled = true)
                 }
                 reload()

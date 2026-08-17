@@ -1,4 +1,4 @@
-﻿package io.github.totomika.pocketmcp.host
+package io.github.totomika.pocketmcp.host
 
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -6,12 +6,11 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.widget.Toast
-import com.dokar.quickjs.QuickJs
 import com.dokar.quickjs.binding.asyncFunction
 import com.dokar.quickjs.binding.function
 import io.github.totomika.pocketmcp.permission.PermissionToken
 import io.github.totomika.pocketmcp.permission.SystemPermissionChecker
-import kotlinx.coroutines.CoroutineScope
+import io.github.totomika.pocketmcp.runtime.RuntimeEntry
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -23,31 +22,31 @@ import kotlinx.coroutines.withContext
  * - toast(msg) (需权限 host.toast, 同步不返回 Promise)
  * - openUrl(url) (需权限 host.openUrl)
  *
- * 见 docs/03-host-api.md 第 3 层。
+ * 第 3 层能力。
  *
- * @param permissionChecker 系统能力权限检查 (M4 注入, null 时跳过检查)
+ * @param permissionChecker 系统能力权限检查 (null 时跳过检查)
  */
 class SystemApi(
     private val context: Context,
     private val permissionChecker: SystemPermissionChecker? = null,
 ) : HostApi {
 
-    override fun inject(quickJs: QuickJs, namespace: String, scope: CoroutineScope) {
-        injectClipboard(quickJs, namespace)
-        injectDeviceInfo(quickJs, namespace)
-        injectToast(quickJs, namespace)
-        injectOpenUrl(quickJs, namespace)
+    override suspend fun inject(entry: RuntimeEntry, namespace: String) {
+        injectClipboard(entry, namespace)
+        injectDeviceInfo(entry, namespace)
+        injectToast(entry, namespace)
+        injectOpenUrl(entry, namespace)
     }
 
-    private fun injectClipboard(quickJs: QuickJs, namespace: String) {
-        quickJs.asyncFunction<String?>("__system_clipboard_get") {
+    private suspend fun injectClipboard(entry: RuntimeEntry, namespace: String) {
+        entry.quickJs.asyncFunction<String?>("__system_clipboard_get") {
             // SECURITY: 此处检查权限
             permissionChecker?.check(namespace, PermissionToken.CLIPBOARD)
             val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             clipboard.primaryClip?.getItemAt(0)?.text?.toString()
         }
 
-        quickJs.asyncFunction<Unit>("__system_clipboard_set") { args ->
+        entry.quickJs.asyncFunction<Unit>("__system_clipboard_set") { args ->
             // SECURITY: 此处检查权限
             permissionChecker?.check(namespace, PermissionToken.CLIPBOARD)
             val text = args[0]?.toString() ?: ""
@@ -55,8 +54,8 @@ class SystemApi(
             clipboard.setPrimaryClip(ClipData.newPlainText("MCPocket", text))
         }
 
-        kotlinx.coroutines.runBlocking {
-            quickJs.evaluate<Any?>(
+        entry.runJs {
+            evaluate<Any?>(
                 """
                 if (typeof host === 'undefined') { var host = {}; }
                 host.system = host.system || {};
@@ -69,16 +68,16 @@ class SystemApi(
         }
     }
 
-    private fun injectDeviceInfo(quickJs: QuickJs, namespace: String) {
-        quickJs.asyncFunction<String>("__system_deviceInfo") {
+    private suspend fun injectDeviceInfo(entry: RuntimeEntry, namespace: String) {
+        entry.quickJs.asyncFunction<String>("__system_deviceInfo") {
             // SECURITY: 此处检查权限
             permissionChecker?.check(namespace, PermissionToken.DEVICE_INFO)
             val metrics = context.resources.displayMetrics
             """{"model":"${Build.MODEL}","androidVersion":"${Build.VERSION.RELEASE}","sdkVersion":${Build.VERSION.SDK_INT},"manufacturer":"${Build.MANUFACTURER}","screen":{"width":${metrics.widthPixels},"height":${metrics.heightPixels},"density":${metrics.density}}}"""
         }
 
-        kotlinx.coroutines.runBlocking {
-            quickJs.evaluate<Any?>(
+        entry.runJs {
+            evaluate<Any?>(
                 """
                 if (typeof host === 'undefined') { var host = {}; }
                 host.system = host.system || {};
@@ -88,9 +87,9 @@ class SystemApi(
         }
     }
 
-    private fun injectToast(quickJs: QuickJs, namespace: String) {
+    private suspend fun injectToast(entry: RuntimeEntry, namespace: String) {
         // toast 同步, 不返回 Promise
-        quickJs.function<Any?>("__system_toast") { args ->
+        entry.quickJs.function<Any?>("__system_toast") { args ->
             // SECURITY: 此处检查权限
             permissionChecker?.check(namespace, PermissionToken.TOAST)
             val text = args[0]?.toString() ?: ""
@@ -100,8 +99,8 @@ class SystemApi(
             null
         }
 
-        kotlinx.coroutines.runBlocking {
-            quickJs.evaluate<Any?>(
+        entry.runJs {
+            evaluate<Any?>(
                 """
                 if (typeof host === 'undefined') { var host = {}; }
                 host.system = host.system || {};
@@ -111,8 +110,8 @@ class SystemApi(
         }
     }
 
-    private fun injectOpenUrl(quickJs: QuickJs, namespace: String) {
-        quickJs.asyncFunction<Unit>("__system_openUrl") { args ->
+    private suspend fun injectOpenUrl(entry: RuntimeEntry, namespace: String) {
+        entry.quickJs.asyncFunction<Unit>("__system_openUrl") { args ->
             // SECURITY: 此处检查权限
             permissionChecker?.check(namespace, PermissionToken.OPEN_URL)
             val url = args[0]?.toString() ?: ""
@@ -123,8 +122,8 @@ class SystemApi(
             }
         }
 
-        kotlinx.coroutines.runBlocking {
-            quickJs.evaluate<Any?>(
+        entry.runJs {
+            evaluate<Any?>(
                 """
                 if (typeof host === 'undefined') { var host = {}; }
                 host.system = host.system || {};

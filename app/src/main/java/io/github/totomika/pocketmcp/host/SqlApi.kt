@@ -1,14 +1,14 @@
-﻿package io.github.totomika.pocketmcp.host
+package io.github.totomika.pocketmcp.host
 
-import com.dokar.quickjs.QuickJs
 import com.dokar.quickjs.binding.asyncFunction
 import io.github.totomika.pocketmcp.data.fs.FsPathManager
-import kotlinx.coroutines.CoroutineScope
+import io.github.totomika.pocketmcp.runtime.RuntimeEntry
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * host.sql API 实现。
@@ -27,16 +27,30 @@ import java.io.File
  * await host.sql.drop("mydb")   // 删除整个数据库文件 (含 WAL/SHM)
  * ```
  *
- * 权限: 自动授予 (docs/03-host-api.md 第 1 层)。
+ * 权限: 自动授予 (第 1 层)。
  */
 class SqlApi(private val pathManager: FsPathManager) : HostApi {
 
-    override fun inject(quickJs: QuickJs, namespace: String, scope: CoroutineScope) {
+    // namespace → (dbName → 打开的连接)。实例字段而非 inject 局部变量:
+    // runtime 销毁时 cleanup(namespace) 需要能找到并关闭该脚本打开的全部连接,
+    // 否则句柄只能等 GC finalizer 兜底 (与 KvApi 的 databases 纪律一致)。
+    private val connections = ConcurrentHashMap<String, MutableMap<String, android.database.sqlite.SQLiteDatabase>>()
+
+    private fun connectionsFor(namespace: String): MutableMap<String, android.database.sqlite.SQLiteDatabase> =
+        connections.getOrPut(namespace) { ConcurrentHashMap() }
+
+    override fun cleanup(namespace: String) {
+        connections.remove(namespace)?.values?.forEach { db ->
+            runCatching { db.close() }
+        }
+    }
+
+    override suspend fun inject(entry: RuntimeEntry, namespace: String) {
         val sqlDir = pathManager.sqlDir(namespace).apply { mkdirs() }
-        val connections = mutableMapOf<String, android.database.sqlite.SQLiteDatabase>()
+        val connections = connectionsFor(namespace)
 
         // open(dbName) → 返回 db handle (字符串 id)
-        quickJs.asyncFunction<String>("__sql_open") { args ->
+        entry.quickJs.asyncFunction<String>("__sql_open") { args ->
             val dbName = args[0]?.toString() ?: "default"
             val dbFile = File(sqlDir, "$dbName.db")
             val db = android.database.sqlite.SQLiteDatabase.openOrCreateDatabase(dbFile, null)
@@ -46,7 +60,7 @@ class SqlApi(private val pathManager: FsPathManager) : HostApi {
         }
 
         // exec(dbName, sql, args?)
-        quickJs.asyncFunction<Unit>("__sql_exec") { args ->
+        entry.quickJs.asyncFunction<Unit>("__sql_exec") { args ->
             val dbName = args[0]?.toString() ?: ""
             val sql = args[1]?.toString() ?: ""
             val bindArgs = parseBindArgs(args.getOrNull(2))
@@ -58,7 +72,7 @@ class SqlApi(private val pathManager: FsPathManager) : HostApi {
         }
 
         // query(dbName, sql, args?) → JSON 行数组
-        quickJs.asyncFunction<String>("__sql_query") { args ->
+        entry.quickJs.asyncFunction<String>("__sql_query") { args ->
             val dbName = args[0]?.toString() ?: ""
             val sql = args[1]?.toString() ?: ""
             val bindArgs = parseBindArgs(args.getOrNull(2))
@@ -91,7 +105,7 @@ class SqlApi(private val pathManager: FsPathManager) : HostApi {
         // execMany(dbName, sqlArray)
         // 注意: quickjs-kt 1.0.5 将 JS Array 映射为 List<Any?>, 不是 Array<*>,
         // 必须同时处理两种类型, 否则 sqlList 为空, 0 条语句执行, 事务提交空操作。
-        quickJs.asyncFunction<Unit>("__sql_execMany") { args ->
+        entry.quickJs.asyncFunction<Unit>("__sql_execMany") { args ->
             val dbName = args[0]?.toString() ?: ""
             val sqlList: List<*> = when (val raw = args[1]) {
                 is List<*> -> raw
@@ -114,7 +128,7 @@ class SqlApi(private val pathManager: FsPathManager) : HostApi {
         }
 
         // close(dbName)
-        quickJs.asyncFunction<Unit>("__sql_close") { args ->
+        entry.quickJs.asyncFunction<Unit>("__sql_close") { args ->
             val dbName = args[0]?.toString() ?: ""
             withContext(Dispatchers.IO) {
                 connections.remove(dbName)?.close()
@@ -122,7 +136,7 @@ class SqlApi(private val pathManager: FsPathManager) : HostApi {
         }
 
         // drop(dbName) → 关闭连接并删除 .db / .db-wal / .db-shm
-        quickJs.asyncFunction<Unit>("__sql_drop") { args ->
+        entry.quickJs.asyncFunction<Unit>("__sql_drop") { args ->
             val dbName = args[0]?.toString() ?: ""
             withContext(Dispatchers.IO) {
                 connections.remove(dbName)?.close()
@@ -131,8 +145,8 @@ class SqlApi(private val pathManager: FsPathManager) : HostApi {
             }
         }
 
-        kotlinx.coroutines.runBlocking {
-            quickJs.evaluate<Any?>(
+        entry.runJs {
+            evaluate<Any?>(
                 """
                 if (typeof host === 'undefined') { var host = {}; }
                 host.sql = {

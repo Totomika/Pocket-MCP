@@ -1,4 +1,4 @@
-﻿package io.github.totomika.pocketmcp.app
+package io.github.totomika.pocketmcp.app
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -41,13 +41,14 @@ class McpForegroundService : Service() {
 
         // 恢复所有已启用的服务 (crash 重启 / app 重启后)
         scope.launch {
+            // app 提到 try 之外: catch 分支也要用它记录错误日志
+            val app = applicationContext as MCPocketApplication
             try {
-                val app = applicationContext as MCPocketApplication
                 val count = app.container.serviceManager.restoreEnabledServices()
                 app.container.logManager.system("Service restored $count service(s) on startup")
                 updateNotification(count)
             } catch (e: Exception) {
-                e.printStackTrace()
+                app.container.logManager.system("Failed to restore services on startup: ${e.message}")
             }
         }
 

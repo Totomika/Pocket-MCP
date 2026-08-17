@@ -4,6 +4,7 @@
     <string name="add">添加</string>
     <string name="add_script_title">添加脚本</string>
     <string name="add_script_to_service_title">添加脚本到此服务</string>
+    <string name="add_scripts_failed">添加脚本失败: %1$s</string>
     <string name="added">已添加</string>
     <string name="advanced_settings">高级设置</string>
     <string name="advanced_settings_saved">高级设置已保存并应用</string>
@@ -65,6 +66,7 @@
     <string name="delete_confirm_title">删除确认</string>
     <string name="delete_service">删除服务</string>
     <string name="delete_service_confirm">确定删除 \"%1$s\"?</string>
+    <string name="delete_service_failed">删除服务失败: %1$s</string>
     <string name="deleted">已删除</string>
     <string name="deleting">删除中...</string>
     <string name="disabled">未启用</string>
@@ -234,6 +236,7 @@
     <string name="prompt_copied">提示词已复制到剪贴板</string>
     <string name="qr_code_title">服务二维码</string>
     <string name="remove">移除</string>
+    <string name="remove_script_failed">移除脚本失败: %1$s</string>
     <string name="rename">重命名</string>
     <string name="requirement_description">需求描述</string>
     <string name="restart">重启</string>
@@ -335,9 +338,11 @@
     <string name="stop">停止</string>
     <string name="stop_service">停止服务</string>
     <string name="stop_service_failed">停止失败: %1$s</string>
+    <string name="toggle_script_failed">切换脚本状态失败: %1$s</string>
     <string name="truncated">…(已截断)</string>
     <string name="type">类型</string>
     <string name="uninstall">卸载</string>
+    <string name="uninstall_failed">卸载失败: %1$s</string>
     <string name="uninstall_purge_data">同时清除运行时数据 (KV / SQL / 文件)</string>
     <string name="uninstall_purge_logs">同时清除相关日志</string>
     <string name="uninstall_risk_note">重启会重置脚本运行时, 同一服务中其他脚本的未持久化数据将丢失。</string>

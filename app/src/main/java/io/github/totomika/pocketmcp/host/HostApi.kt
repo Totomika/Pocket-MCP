@@ -1,7 +1,6 @@
-﻿package io.github.totomika.pocketmcp.host
+package io.github.totomika.pocketmcp.host
 
-import com.dokar.quickjs.QuickJs
-import kotlinx.coroutines.CoroutineScope
+import io.github.totomika.pocketmcp.runtime.RuntimeEntry
 
 /**
  * host.* API 注入接口。
@@ -10,13 +9,16 @@ import kotlinx.coroutines.CoroutineScope
  */
 interface HostApi {
     /**
-     * 注入 API 到 QuickJS。
+     * 注入 API 到当前 runtime。
      *
-     * @param quickJs QuickJs 实例
+     * 绑定注册 (function / asyncFunction) 是 define 操作, 不执行 JS, 直接用
+     * [RuntimeEntry.quickJs] 注册; 注入期的 JS glue (evaluate) 一律经
+     * [RuntimeEntry.runJs] 在 runtime 专属线程执行, 不得在任何线程直接 evaluate。
+     *
+     * @param entry 目标 runtime (提供 quickJs / scope / runJs)
      * @param namespace 当前脚本 namespace (用于数据隔离)
-     * @param scope 协程作用域 (用于异步操作)
      */
-    fun inject(quickJs: QuickJs, namespace: String, scope: CoroutineScope)
+    suspend fun inject(entry: RuntimeEntry, namespace: String)
 
     /**
      * 清理指定 namespace 持有的资源 (DB handles, connections 等)。

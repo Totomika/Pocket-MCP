@@ -1,10 +1,9 @@
-﻿package io.github.totomika.pocketmcp.host
+package io.github.totomika.pocketmcp.host
 
 import android.database.sqlite.SQLiteDatabase
-import com.dokar.quickjs.QuickJs
 import com.dokar.quickjs.binding.asyncFunction
 import io.github.totomika.pocketmcp.data.fs.FsPathManager
-import kotlinx.coroutines.CoroutineScope
+import io.github.totomika.pocketmcp.runtime.RuntimeEntry
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -25,15 +24,15 @@ import java.util.concurrent.ConcurrentHashMap
  * await host.kv.clear()
  * ```
  *
- * 权限: 自动授予 (docs/03-host-api.md 第 1 层)。
+ * 权限: 自动授予 (第 1 层)。
  */
 class KvApi(private val pathManager: FsPathManager) : HostApi {
 
     /** per-namespace DB handles, 在 cleanup() 时关闭 */
     private val databases = ConcurrentHashMap<String, SQLiteDatabase>()
 
-    override fun inject(quickJs: QuickJs, namespace: String, scope: CoroutineScope) {
-        val db = kotlinx.coroutines.runBlocking(Dispatchers.IO) {
+    override suspend fun inject(entry: RuntimeEntry, namespace: String) {
+        val db = withContext(Dispatchers.IO) {
             val kvDir = pathManager.kvDir(namespace).apply { mkdirs() }
             val dbFile = File(kvDir, "kvstore.db")
             val db = SQLiteDatabase.openOrCreateDatabase(dbFile, null)
@@ -43,7 +42,7 @@ class KvApi(private val pathManager: FsPathManager) : HostApi {
         databases[namespace] = db
 
         // host.kv.set(key, value)
-        quickJs.asyncFunction<Unit>("__kv_set") { args ->
+        entry.quickJs.asyncFunction<Unit>("__kv_set") { args ->
             val key = args[0]?.toString() ?: ""
             val value = args[1]?.toString() ?: ""
             withContext(Dispatchers.IO) {
@@ -55,7 +54,7 @@ class KvApi(private val pathManager: FsPathManager) : HostApi {
         }
 
         // host.kv.get(key) → string | null
-        quickJs.asyncFunction<String?>("__kv_get") { args ->
+        entry.quickJs.asyncFunction<String?>("__kv_get") { args ->
             val key = args[0]?.toString() ?: ""
             withContext(Dispatchers.IO) {
                 val cursor = db.rawQuery(
@@ -69,7 +68,7 @@ class KvApi(private val pathManager: FsPathManager) : HostApi {
         }
 
         // host.kv.delete(key)
-        quickJs.asyncFunction<Unit>("__kv_delete") { args ->
+        entry.quickJs.asyncFunction<Unit>("__kv_delete") { args ->
             val key = args[0]?.toString() ?: ""
             withContext(Dispatchers.IO) {
                 db.execSQL("DELETE FROM kv_store WHERE `key` = ?", arrayOf(key))
@@ -77,7 +76,7 @@ class KvApi(private val pathManager: FsPathManager) : HostApi {
         }
 
         // host.kv.list() → string[]
-        quickJs.asyncFunction<String>("__kv_list") {
+        entry.quickJs.asyncFunction<String>("__kv_list") {
             withContext(Dispatchers.IO) {
                 val cursor = db.rawQuery("SELECT `key` FROM kv_store ORDER BY `key`", null)
                 cursor.use {
@@ -91,14 +90,14 @@ class KvApi(private val pathManager: FsPathManager) : HostApi {
         }
 
         // host.kv.clear()
-        quickJs.asyncFunction<Unit>("__kv_clear") {
+        entry.quickJs.asyncFunction<Unit>("__kv_clear") {
             withContext(Dispatchers.IO) {
                 db.execSQL("DELETE FROM kv_store")
             }
         }
 
-        kotlinx.coroutines.runBlocking {
-            quickJs.evaluate<Any?>(
+        entry.runJs {
+            evaluate<Any?>(
                 """
                 if (typeof host === 'undefined') { var host = {}; }
                 host.kv = {

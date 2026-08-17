@@ -1,10 +1,9 @@
-﻿package io.github.totomika.pocketmcp.host
+package io.github.totomika.pocketmcp.host
 
-import com.dokar.quickjs.QuickJs
 import com.dokar.quickjs.binding.asyncFunction
 import io.github.totomika.pocketmcp.data.fs.FsPathManager
+import io.github.totomika.pocketmcp.runtime.RuntimeEntry
 import io.github.totomika.pocketmcp.runtime.RuntimeFactory
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -40,7 +39,7 @@ import java.util.concurrent.ConcurrentHashMap
  *
  * `lines(path)` 返回 async generator, 流式逐行遍历大文件 (有状态迭代器, O(n))。
  *
- * 见 docs/03-host-api.md 第 2 层。
+ * 第 2 层能力。
  */
 class FsApi(
     private val pathManager: FsPathManager,
@@ -54,12 +53,13 @@ class FsApi(
      */
     private val iterators = ConcurrentHashMap<String, BufferedReader>()
 
-    override fun inject(quickJs: QuickJs, namespace: String, scope: CoroutineScope) {
-        // scope 暂未使用: asyncFunction 内部由 quickjs-kt 管理协程调度,
-        // withContext(Dispatchers.IO) 使用全局 IO 调度器。保留参数以符合 HostApi 接口约定。
-        injectPrivate(quickJs, namespace)
-        injectExternal(quickJs, namespace)
-        injectShared(quickJs, namespace)
+    override suspend fun inject(entry: RuntimeEntry, namespace: String) {
+        // 绑定注册 (asyncFunction) 是 define 操作, 不在 dispatcher 上执行 JS;
+        // 运行期回调由 quickjs-kt 内部调度, withContext(Dispatchers.IO) 使用全局 IO 调度器。
+        // 注入期的 JS glue (evaluate) 经 entry.runJs 在 runtime 专属线程执行。
+        injectPrivate(entry, namespace)
+        injectExternal(entry, namespace)
+        injectShared(entry, namespace)
     }
 
     override fun cleanup(namespace: String) {
@@ -72,9 +72,9 @@ class FsApi(
 
     // region namespace 注入
 
-    private fun injectPrivate(quickJs: QuickJs, namespace: String) {
+    private suspend fun injectPrivate(entry: RuntimeEntry, namespace: String) {
         injectFsOperations(
-            quickJs = quickJs,
+            entry = entry,
             namespace = namespace,
             prefix = "private",
             strategy = SandboxPathStrategy(pathManager.privateRoot(namespace)),
@@ -82,9 +82,9 @@ class FsApi(
         )
     }
 
-    private fun injectExternal(quickJs: QuickJs, namespace: String) {
+    private suspend fun injectExternal(entry: RuntimeEntry, namespace: String) {
         injectFsOperations(
-            quickJs = quickJs,
+            entry = entry,
             namespace = namespace,
             prefix = "external",
             strategy = SandboxPathStrategy(pathManager.externalRoot(namespace)),
@@ -92,14 +92,14 @@ class FsApi(
         )
     }
 
-    private fun injectShared(quickJs: QuickJs, namespace: String) {
+    private suspend fun injectShared(entry: RuntimeEntry, namespace: String) {
         val checker = permissionChecker
             ?: throw IllegalStateException(
                 "FsApi: shared namespace requires a non-null FsPermissionChecker; " +
                         "got null. Inject a checker (prod) or an AlwaysGranted stub (tests)."
             )
         injectFsOperations(
-            quickJs = quickJs,
+            entry = entry,
             namespace = namespace,
             prefix = "shared",
             strategy = SharedPathStrategy(pathManager),
@@ -161,12 +161,13 @@ class FsApi(
     /**
      * 注入指定命名空间的文件操作。
      *
+     * @param entry 目标 runtime (绑定注册 + JS glue evaluate 均经由它)
      * @param prefix JS 内部函数名前缀 (`private` / `external` / `shared`)
      * @param strategy 路径解析策略
      * @param permissionChecker 非 null 时在读写操作前执行权限检查 (仅 shared 使用)
      */
-    private fun injectFsOperations(
-        quickJs: QuickJs,
+    private suspend fun injectFsOperations(
+        entry: RuntimeEntry,
         namespace: String,
         prefix: String,
         strategy: PathStrategy,
@@ -192,7 +193,7 @@ class FsApi(
         //      memoryLimit=UNLIMITED (无限制) 时跳过此检查
         // 范围读取用 RandomAccessFile.seek 定位 (minSdk=26 无 InputStream.readNBytes),
         // UTF-8 解码对半截多字节字符用 U+FFFD 替换 (String(bytes, UTF_8) 默认行为).
-        quickJs.asyncFunction<String>("${fnPrefix}_read") { args ->
+        entry.quickJs.asyncFunction<String>("${fnPrefix}_read") { args ->
             val path = requirePathArg(args)
             val force = args.getOrNull(1) as? Boolean ?: false
             val offset = (args.getOrNull(2) as? Number)?.toLong() ?: 0L
@@ -210,8 +211,8 @@ class FsApi(
 
             // 在 withContext(Dispatchers.IO) 前读取 QuickJS 内存信息
             // (asyncFunction lambda 初始运行在 QuickJs dispatcher 上, 访问 memoryUsage 更安全)
-            val memLimit = quickJs.memoryLimit
-            val memUsed = if (!RuntimeFactory.isUnlimited(memLimit)) quickJs.memoryUsage.memoryUsedSize else 0L
+            val memLimit = entry.quickJs.memoryLimit
+            val memUsed = if (!RuntimeFactory.isUnlimited(memLimit)) entry.quickJs.memoryUsage.memoryUsedSize else 0L
 
             withContext(Dispatchers.IO) {
                 val fileSize = file.length()
@@ -272,7 +273,7 @@ class FsApi(
 
         // readBytes → 返回 Base64 编码字符串 (JS 侧 host.crypto.b64decode 解码为 Uint8Array)
         // 防 OOM: 超过 [READ_BYTES_MAX_BYTES] 抛, 避免进程崩溃
-        quickJs.asyncFunction<String>("${fnPrefix}_readBytes") { args ->
+        entry.quickJs.asyncFunction<String>("${fnPrefix}_readBytes") { args ->
             val path = requirePathArg(args)
             val file = resolvePath(path)
             checkRead(file)
@@ -289,7 +290,7 @@ class FsApi(
         }
 
         // write
-        quickJs.asyncFunction<Unit>("${fnPrefix}_write") { args ->
+        entry.quickJs.asyncFunction<Unit>("${fnPrefix}_write") { args ->
             val path = requirePathArg(args)
             val content = args.getOrNull(1)?.toString() ?: ""
             val file = resolvePath(path)
@@ -301,7 +302,7 @@ class FsApi(
         }
 
         // append
-        quickJs.asyncFunction<Unit>("${fnPrefix}_append") { args ->
+        entry.quickJs.asyncFunction<Unit>("${fnPrefix}_append") { args ->
             val path = requirePathArg(args)
             val content = args.getOrNull(1)?.toString() ?: ""
             val file = resolvePath(path)
@@ -313,7 +314,7 @@ class FsApi(
         }
 
         // exists (统一 IO 调度, 与其它 op 一致)
-        quickJs.asyncFunction<Boolean>("${fnPrefix}_exists") { args ->
+        entry.quickJs.asyncFunction<Boolean>("${fnPrefix}_exists") { args ->
             val path = requirePathArg(args)
             val file = resolvePath(path)
             checkRead(file)
@@ -321,7 +322,7 @@ class FsApi(
         }
 
         // mkdir → 返回是否成功创建 (Boolean)
-        quickJs.asyncFunction<Boolean>("${fnPrefix}_mkdir") { args ->
+        entry.quickJs.asyncFunction<Boolean>("${fnPrefix}_mkdir") { args ->
             val path = requirePathArg(args)
             val file = resolvePath(path)
             checkWrite(file)
@@ -329,7 +330,7 @@ class FsApi(
         }
 
         // readdir → JSON 字符串数组; 防 OOM: 限制 [READDIR_MAX_ENTRIES]
-        quickJs.asyncFunction<String>("${fnPrefix}_readdir") { args ->
+        entry.quickJs.asyncFunction<String>("${fnPrefix}_readdir") { args ->
             val path = requirePathArg(args)
             val file = resolvePath(path)
             checkRead(file)
@@ -350,7 +351,7 @@ class FsApi(
         }
 
         // stat → JSON
-        quickJs.asyncFunction<String>("${fnPrefix}_stat") { args ->
+        entry.quickJs.asyncFunction<String>("${fnPrefix}_stat") { args ->
             val path = requirePathArg(args)
             val file = resolvePath(path)
             checkRead(file)
@@ -369,7 +370,7 @@ class FsApi(
         }
 
         // delete → 返回是否成功 (Boolean)
-        quickJs.asyncFunction<Boolean>("${fnPrefix}_delete") { args ->
+        entry.quickJs.asyncFunction<Boolean>("${fnPrefix}_delete") { args ->
             val path = requirePathArg(args)
             val file = resolvePath(path)
             checkWrite(file)
@@ -377,7 +378,7 @@ class FsApi(
         }
 
         // rename
-        quickJs.asyncFunction<Unit>("${fnPrefix}_rename") { args ->
+        entry.quickJs.asyncFunction<Unit>("${fnPrefix}_rename") { args ->
             val oldPath = requirePathArg(args)
             val newPath = args.getOrNull(1)?.toString()
                 ?: throw IllegalArgumentException("rename: newPath argument is required")
@@ -397,7 +398,7 @@ class FsApi(
         // --- 行迭代器 (有状态, 流式读取大文件, O(n) 总计) ---
 
         // openLineIter → 返回 iterator ID; Kotlin 侧持有 BufferedReader 保持文件句柄
-        quickJs.asyncFunction<String>("${fnPrefix}_openLineIter") { args ->
+        entry.quickJs.asyncFunction<String>("${fnPrefix}_openLineIter") { args ->
             val path = requirePathArg(args)
             val file = resolvePath(path)
             checkRead(file)
@@ -411,7 +412,7 @@ class FsApi(
 
         // nextLines → 批量读取下一组行; 返回 JSON { lines: [...], eof: bool }
         // 批量减少 bridge 往返开销 (如 50000 行 / 100 批 = 500 次调用)
-        quickJs.asyncFunction<String>("${fnPrefix}_nextLines") { args ->
+        entry.quickJs.asyncFunction<String>("${fnPrefix}_nextLines") { args ->
             val id = args.getOrNull(0)?.toString()
                 ?: throw IllegalArgumentException("nextLines: iterator id is required")
             if (!id.startsWith("$namespace:$prefix:")) {
@@ -432,16 +433,16 @@ class FsApi(
         }
 
         // closeLineIter → 关闭迭代器, 释放文件句柄
-        quickJs.asyncFunction<Unit>("${fnPrefix}_closeLineIter") { args ->
+        entry.quickJs.asyncFunction<Unit>("${fnPrefix}_closeLineIter") { args ->
             val id = args.getOrNull(0)?.toString()
                 ?: throw IllegalArgumentException("closeLineIter: iterator id is required")
             iterators.remove(id)?.close()
         }
 
         // JS 侧 wrapper 暴露为 host.fs.<prefix>.<method>
-        // quickjs.evaluate 是 suspend, 用 runBlocking 桥接 (与 FetchApi/SystemApi 一致)
-        kotlinx.coroutines.runBlocking {
-            quickJs.evaluate<Any?>(
+        // 注入期 evaluate 经 entry.runJs 在 runtime 专属线程执行
+        entry.runJs {
+            evaluate<Any?>(
                 """
                 if (typeof host === 'undefined') { var host = {}; }
                 host.fs = host.fs || {};
