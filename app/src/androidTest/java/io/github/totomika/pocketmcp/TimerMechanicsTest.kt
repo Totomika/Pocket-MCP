@@ -29,6 +29,7 @@ import org.junit.Test
  * 在 Android 设备/模拟器上运行 (QuickJs native lib 需要 Android)。
  * JS 执行统一经 [RuntimeEntry.runJs] (与主代码不变量一致)。
  */
+@OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class TimerMechanicsTest {
 
     /** 构造仅含第 0 层 host API 的独立 runtime (不走 RuntimeFactory, 保持测试最小化)。 */
