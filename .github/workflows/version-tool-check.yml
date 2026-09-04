@@ -1,0 +1,21 @@
+name: Version tool self-check
+
+# 版本号校验脚本 (tools/release_tag_check.py) 的自检: 改动脚本/夹具/自身时自动跑 fixture 用例
+on:
+  push:
+    paths:
+      - "tools/**"
+      - ".github/workflows/version-tool-check.yml"
+  pull_request:
+    paths:
+      - "tools/**"
+
+jobs:
+  selfcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run version tool tests
+        shell: bash
+        run: python3 tools/release_tag_check_tests.py

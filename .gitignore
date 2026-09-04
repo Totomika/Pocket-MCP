@@ -17,3 +17,7 @@ Thumbs.db
 # Other
 /.temp/
 /AGENTS.md
+
+# Python (CI 版本工具)
+__pycache__/
+*.pyc

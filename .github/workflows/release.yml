@@ -1,0 +1,114 @@
+name: Build & Release
+
+on:
+  # 发布唯一入口: 网页手动触发, 填写版本名。
+  # 不允许通过 push tag 触发, 禁止手工打 tag (规则见 docs/release.md)
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "发布版本 (如 26.08.6 / 26.08.6-rc2, v 前缀可选)"
+        required: true
+        type: string
+
+permissions:
+  contents: write # 创建 tag 与 GitHub Release 所需
+
+# 同一时间只允许一条发布流水线: VersionCode 分配依赖单一写入者, 串行保证无竞态
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      # 发布 tag 必须指向默认分支: 固定 ref, 避免从任意分支手动触发发布 (tag 记录与代码需保持一致)
+      - name: Checkout (含全部 tag 及注解消息)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+
+      # 解析 + 校验版本名 + 分配 VersionCode (规则见 docs/release.md, 实现在 tools/release_tag_check.py)
+      # 注册表经 stdin 管道传入 (NUL 分隔, 消息正文任意文本都不会破坏解析)
+      # 失败即终止: 不产生任何 tag / Release
+      - name: Validate version & allocate code
+        id: version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.version }}
+        run: |
+          json="$(git for-each-ref 'refs/tags' --format='%(refname:short)%00%(creatordate:iso-strict)%00%(contents:body)%00' \
+            | python3 tools/release_tag_check.py --tag "$RELEASE_TAG")" || exit 1
+          echo "json=$json" >> "$GITHUB_OUTPUT"
+          echo "OK: $RELEASE_TAG -> VersionCode $(python3 -c 'import json,sys;print(json.load(sys.stdin)["code"])' <<< "$json")"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # Secrets 未配置时快速失败, 避免静默产出未签名 APK 后报出难懂的错误
+      - name: Validate signing secrets
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          for name in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            [ -n "${!name}" ] || { echo "::error::$name secret is not configured"; exit 1; }
+          done
+
+      # 构建签名 APK: 版本名/Code 由校验步骤注入 (发布构建的 versionCode 不允许被覆盖)
+      - name: Build signed release APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          VERSION_NAME: ${{ fromJSON(steps.version.outputs.json).name }}
+          VERSION_CODE: ${{ fromJSON(steps.version.outputs.json).code }}
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Rename APK
+        run: |
+          mv app/build/outputs/apk/release/app-release.apk \
+             app/build/outputs/apk/release/MCPocket-${{ fromJSON(steps.version.outputs.json).name }}.apk
+
+      # 校验发布产物签名: 取 build-tools 最新版 apksigner (runner 预装 Android SDK, 无需安装)
+      # 无 $ANDROID_HOME / 找不到 apksigner / 校验失败均以 ::error:: 快速失败, 防止误发未签名产物
+      - name: Verify APK signature
+        run: |
+          [ -n "$ANDROID_HOME" ] || { echo "::error::ANDROID_HOME is not set"; exit 1; }
+          apksigner="$(ls "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -n 1)" \
+            || { echo "::error::apksigner not found under $ANDROID_HOME/build-tools"; exit 1; }
+          "$apksigner" verify --print-certs app/build/outputs/apk/release/MCPocket-*.apk \
+            || { echo "::error::APK signature verification failed"; exit 1; }
+
+      # 构建成功后打注解 tag, 消息体携带 VersionCode (流水线靠它统计当天发布数, 见 docs/release.md)
+      # 顺序保证: 构建成功 -> 打 tag -> 建 Release; 构建失败不会留下孤儿 tag
+      - name: Create and push annotated tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${{ fromJSON(steps.version.outputs.json).name }}" -m "Pocket-MCP ${{ fromJSON(steps.version.outputs.json).name }}
+
+          VersionCode: ${{ fromJSON(steps.version.outputs.json).code }}"
+          git push origin "v${{ fromJSON(steps.version.outputs.json).name }}"
+
+      # 创建 Draft Release (确认无误后人工发布); 候选版本自动标记 Pre-release
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ fromJSON(steps.version.outputs.json).name }}
+          name: v${{ fromJSON(steps.version.outputs.json).name }}
+          files: app/build/outputs/apk/release/MCPocket-*.apk
+          generate_release_notes: true
+          draft: true
+          prerelease: ${{ fromJSON(steps.version.outputs.json).isCandidate == 'true' }}

@@ -1,3 +1,5 @@
+import java.util.Base64
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -6,16 +8,54 @@ plugins {
     id("com.google.devtools.ksp")
 }
 
+// ===== CI 注入的可选配置 (GitHub Actions 发布时通过环境变量传入, 本地构建留空不受影响) =====
+// 发布签名: 正式 keystore 以 base64 形式存于仓库 Secrets, CI 解码后临时写入文件用于签名
+// 注1: 变量名避开 SigningConfig 的同名属性 (keyAlias/keyPassword), 防止 DSL 块内 receiver 遮蔽
+// 注2: keystore 在配置阶段即写入文件 (配置期副作用), 若日后启用 Gradle configuration cache 需改造
+val ciKeystoreBase64: String? = System.getenv("KEYSTORE_BASE64")
+val ciKeystorePassword: String? = System.getenv("KEYSTORE_PASSWORD")
+val ciKeyAlias: String? = System.getenv("KEY_ALIAS")
+val ciKeyPassword: String? = System.getenv("KEY_PASSWORD")
+// 版本号覆盖: 优先 -P 命令行属性 (./gradlew -PversionName=26.08.6-rc2), 其次环境变量 (发布流水线注入)
+// 本地/PR 构建固定 versionName="dev"、versionCode=1: 不参与发布版本规则, 规则见 docs/release.md
+val ciVersionName: String? = providers.gradleProperty("versionName").orNull
+    ?: System.getenv("VERSION_NAME")
+val ciVersionCode: Int? = (providers.gradleProperty("versionCode").orNull
+    ?: System.getenv("VERSION_CODE"))?.toIntOrNull()
+
 android {
     namespace = "io.github.totomika.pocketmcp"
     compileSdk = 36
+
+    signingConfigs {
+        if (!ciKeystoreBase64.isNullOrEmpty() && !ciKeystorePassword.isNullOrEmpty()
+            && !ciKeyAlias.isNullOrEmpty() && !ciKeyPassword.isNullOrEmpty()
+        ) {
+            create("ciRelease") {
+                // CI 上写入临时目录; 本地调试时写入 build 目录 (均不会被 git 跟踪)
+                val keystoreFile = File(
+                    System.getenv("RUNNER_TEMP") ?: layout.buildDirectory.get().asFile.absolutePath,
+                    "release-keystore.jks"
+                )
+                // MimeDecoder 容忍换行/空白, 避免 Secrets 中 base64 折行导致解码失败
+                keystoreFile.writeBytes(Base64.getMimeDecoder().decode(ciKeystoreBase64))
+                this.storeFile = keystoreFile
+                this.storePassword = ciKeystorePassword
+                this.keyAlias = ciKeyAlias
+                this.keyPassword = ciKeyPassword
+            }
+        } else {
+            // Secrets 不完整时显式告警; CI 上 workflow 另有前置校验会快速失败, 此处兜底本地调试场景
+            logger.warn("ciRelease signing skipped: KEYSTORE_* env vars incomplete")
+        }
+    }
 
     defaultConfig {
         applicationId = "io.github.totomika.pocketmcp"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = ciVersionCode ?: 1
+        versionName = ciVersionName ?: "dev"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -30,6 +70,8 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            // 仅当 CI 注入了签名配置时才签名, 本地无 env 时保持原行为 (不签名)
+            signingConfigs.findByName("ciRelease")?.let { signingConfig = it }
         }
     }
     compileOptions {

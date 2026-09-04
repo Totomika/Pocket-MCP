@@ -1,0 +1,8 @@
+# 统一文本文件行尾: 仓库内与检出均使用 LF, 避免 CRLF 混入 workflow run 脚本 / tag 消息体
+* text=auto
+*.yml text eol=lf
+*.yaml text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.kt text eol=lf
+*.kts text eol=lf
