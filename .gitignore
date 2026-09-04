@@ -21,3 +21,8 @@ Thumbs.db
 # Python (CI 版本工具)
 __pycache__/
 *.pyc
+
+# Signing keys (永远只在 CI Secrets 中以 base64 存在, 绝不进仓库)
+*.jks
+*.keystore
+*.b64
